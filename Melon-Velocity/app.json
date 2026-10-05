@@ -4,7 +4,7 @@
     "slug": "Melon-Velocity",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/images/icon.png",
+    "icon": "./assets/images/icon.jpg",
     "scheme": "melonvelocity",
     "userInterfaceStyle": "automatic",
     "ios": {
@@ -41,7 +41,7 @@
         "expo-splash-screen",
         {
           "backgroundColor": "#208AEF",
-          "image": "./assets/images/splash-icon.png",
+          "image": "./assets/images/splash-icon.jpg",
           "imageWidth": 76
         }
       ],
@@ -60,6 +60,13 @@
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
-    }
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "5c900016-39f5-41da-ba22-8bce5ee61a98"
+      }
+    },
+    "owner": "mame33"
   }
 }
