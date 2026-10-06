@@ -8,3 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Runtime media and authentication cookies
+app/storage/
+.env

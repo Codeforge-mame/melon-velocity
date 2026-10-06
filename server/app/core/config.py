@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     BASE_DIR: str = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     DOWNLOAD_DIR: str = os.path.join(BASE_DIR, "storage", "downloads")
     TEMP_DIR: str = os.path.join(BASE_DIR, "storage", "temp")
+    YTDLP_COOKIE_FILE: str = os.path.join(BASE_DIR, "storage", "cookies.txt")
 
     # Rate limiting configuration
     RATE_LIMIT_MAX_TOKENS: int = 5

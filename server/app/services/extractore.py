@@ -1,5 +1,10 @@
 import yt_dlp
 import asyncio
+import os
+from typing import Any
+from yt_dlp.networking.impersonate import ImpersonateTarget
+
+from app.core.config import settings
 
 # Detect if curl_cffi is available for TLS impersonation (needed for TikTok)
 try:
@@ -10,18 +15,28 @@ except ImportError:
 
 class VideoExtractorService:
     @staticmethod
-    async def extract_metadata(target_url: str) -> dict:
-        ydl_opts = {
-            'dumpjson': True,
+    def build_ydl_options() -> dict[str, Any]:
+        ydl_opts: dict[str, Any] = {
             'noplaylist': True,
             'extractor_args': {'youtube': ['player-client=android,ios']},
         }
 
-        # Enable browser TLS impersonation for platforms that block default requests
-        # (TikTok, Instagram, Twitter, etc.) — requires curl_cffi to be installed
         if _HAS_CURL_CFFI:
-            ydl_opts['impersonate'] = 'chrome'
-        
+            ydl_opts['impersonate'] = ImpersonateTarget.from_str('chrome-131')
+
+        if os.path.isfile(settings.YTDLP_COOKIE_FILE):
+            ydl_opts['cookiefile'] = settings.YTDLP_COOKIE_FILE
+        elif os.environ.get('YTDLP_COOKIE_FILE'):
+            raise FileNotFoundError(
+                f"Configured yt-dlp cookie file does not exist: {settings.YTDLP_COOKIE_FILE}"
+            )
+
+        return ydl_opts
+
+    @staticmethod
+    async def extract_metadata(target_url: str) -> dict:
+        ydl_opts = VideoExtractorService.build_ydl_options()
+
         loop = asyncio.get_event_loop()
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -30,10 +45,10 @@ class VideoExtractorService:
                     lambda: ydl.extract_info(target_url, download=False)
                 )
         except Exception as e:
-            raise Exception(f"yt-dlp core failed: {str(e)}")
+            raise RuntimeError(f"yt-dlp core failed: {str(e)}") from e
             
         if not metadata:
-            raise Exception("Failed to resolve metadata footprint structures.")
+            raise RuntimeError("Failed to resolve metadata footprint structures.")
 
         raw_formats = metadata.get("formats", [])
         parsed_formats = []

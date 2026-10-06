@@ -26,8 +26,14 @@ class VideoMetadataResponse(BaseModel):
     sourceUrl: str
     formats: List[FormatPayload]
 
-class DownloadReadyResponse(BaseModel):
+class DownloadQueuedResponse(BaseModel):
     success: bool
     message: str
-    fileName: str
-    fileSize: int
+    taskId: str
+
+class DownloadStatusResponse(BaseModel):
+    taskId: str
+    status: str
+    fileName: Optional[str] = None
+    fileSize: Optional[int] = None
+    error: Optional[str] = None

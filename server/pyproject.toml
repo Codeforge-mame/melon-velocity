@@ -8,9 +8,11 @@ dependencies = [
     "aiohttp>=3.14.3",
     "fastapi>=0.142.2",
     "httpx>=0.28.1",
+    "celery>=5.5.3",
     "pydantic>=2.13.5",
     "pydantic-settings>=2.15.0",
     "python-dotenv>=1.2.4",
+    "redis>=6.4.0",
     "uvicorn>=0.54.0",
-    "yt-dlp>=2026.8.19",
+    "yt-dlp[default,curl-cffi]>=2026.8.19",
 ]

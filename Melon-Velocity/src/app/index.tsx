@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { View, Text, TextInput, TouchableOpacity, Image, ScrollView, ActivityIndicator, Alert, Switch } from 'react-native';
+import { View, Text, TextInput, TouchableOpacity, Image, ScrollView, ActivityIndicator, Alert, Switch, Platform } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as MediaLibrary from 'expo-media-library';
@@ -8,6 +8,17 @@ import { useFastApiMetadata, VideoFormat } from '../hooks/useFatapi';
 import { useLogDownload } from '../hooks/useVideoQueries';
 import { executeDownload as executeSingleThreadDownload } from '../utils/downloadEngine';
 import { BACKEND_BASE_URL } from '../constants/config';
+
+interface DownloadQueuedResponse {
+  taskId: string;
+}
+
+interface DownloadStatusResponse {
+  status: 'queued' | 'processing' | 'retrying' | 'success' | 'failure';
+  fileName?: string;
+  fileSize?: number;
+  error?: string;
+}
 
 export default function HomeScreen() {
   const router = useRouter();
@@ -33,23 +44,27 @@ export default function HomeScreen() {
     setSearchUrl(inputUrl.trim());
   };
 
-  const saveToGallery = async (fileUri: string): Promise<void> => {
-    try {
-      const { status } = await MediaLibrary.requestPermissionsAsync();
-      if (status === 'granted') {
-        const asset = await MediaLibrary.createAssetAsync(fileUri);
-        // Save to a dedicated "MeloStream" album in the gallery
-        const albums = await MediaLibrary.getAlbumsAsync();
-        const existing = albums.find(a => a.title === 'MeloStream');
-        if (existing) {
-          await MediaLibrary.addAssetsToAlbumAsync([asset], existing, false);
-        } else {
-          await MediaLibrary.createAlbumAsync('MeloStream', asset, false);
-        }
-      }
-    } catch (_) {
-      // Non-fatal: file is still saved at finalLocalUri even if gallery save fails
+  const requestGalleryPermission = async (): Promise<void> => {
+    if (Platform.OS === 'web') return;
+
+    const permission = await MediaLibrary.requestPermissionsAsync(false, ['video']);
+    if (!permission.granted) {
+      throw new Error('Gallery permission is required to save downloaded videos.');
     }
+  };
+
+  const saveToGallery = async (fileUri: string): Promise<string> => {
+    if (Platform.OS === 'web') return fileUri;
+
+    const album = await MediaLibrary.Album.get('MeloStream');
+    const asset = await MediaLibrary.Asset.create(fileUri, album ?? undefined);
+    if (!album) {
+      await MediaLibrary.Album.create('MeloStream', [asset]);
+    }
+
+    const galleryUri = await asset.getUri();
+    await FileSystem.deleteAsync(fileUri);
+    return galleryUri;
   };
 
   const handleDownload = async () => {
@@ -62,6 +77,7 @@ export default function HomeScreen() {
       setIsDownloading(true);
       setDownloadProgress(0);
       setDownloadSpeed(0);
+      await requestGalleryPermission();
       const downloadStartTime = Date.now();
 
       const appStorageDirectory = FileSystem.documentDirectory ?? FileSystem.cacheDirectory ?? '';
@@ -75,7 +91,7 @@ export default function HomeScreen() {
       }
 
       if (isBoostMode) {
-        // --- 🚀 MODE A: FASTAPI SERVER MULTI-THREADED ACCELERATION ---
+        // --- 🚀 MODE A: FASTAPI CELERY BACKGROUND DOWNLOAD ---
         const serverResponse = await fetch(`${BACKEND_BASE_URL}/download`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -91,7 +107,32 @@ export default function HomeScreen() {
           throw new Error(errData.detail || 'Server-side chunk assembly acceleration failed.');
         }
 
-        const { fileName } = await serverResponse.json();
+        const { taskId } = await serverResponse.json() as DownloadQueuedResponse;
+        if (!taskId) throw new Error('The server did not return a download task ID.');
+        let fileName: string | undefined;
+
+        while (!fileName) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 1000));
+          const statusResponse = await fetch(
+            `${BACKEND_BASE_URL}/download/${encodeURIComponent(taskId)}`
+          );
+          if (!statusResponse.ok) {
+            const errData = await statusResponse.json();
+            throw new Error(errData.detail || 'Could not read server download status.');
+          }
+
+          const taskStatus = await statusResponse.json() as DownloadStatusResponse;
+          if (taskStatus.status === 'failure') {
+            throw new Error(taskStatus.error || 'Server-side video processing failed.');
+          }
+          if (taskStatus.status === 'success') {
+            if (!taskStatus.fileName) {
+              throw new Error('Server reported success without returning a video file.');
+            }
+            fileName = taskStatus.fileName;
+          }
+        }
+
         const targetStreamUrl = `${BACKEND_BASE_URL}/stream/${fileName}`;
         const targetLocalPath = `${localDirectory}${fileName}`;
 
@@ -132,14 +173,19 @@ export default function HomeScreen() {
       }
 
       // Save to device gallery/My Files so it's accessible outside the app
-      await saveToGallery(finalLocalUri);
+      const localFileInfo = await FileSystem.getInfoAsync(finalLocalUri);
+      const downloadedFileSize =
+        localFileInfo.exists && typeof localFileInfo.size === 'number'
+          ? localFileInfo.size
+          : selectedFormat.fileSizeEstimate ?? 0;
+      finalLocalUri = await saveToGallery(finalLocalUri);
 
       // Record in local SQLite history database
       await logDownloadMutation.mutateAsync({
         title: videoInfo.title,
         url: videoInfo.sourceUrl,
         localPath: finalLocalUri,
-        fileSize: selectedFormat.fileSizeEstimate || 0,
+        fileSize: downloadedFileSize,
         resolution: selectedFormat.resolution,
         thumbnail: videoInfo.thumbnail,
       });
@@ -149,9 +195,12 @@ export default function HomeScreen() {
         'Video saved to your device and MeloStream library!',
       );
 
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error('[MeloStream Download Runtime Interrupted]:', err);
-      Alert.alert('Download Interrupted', err.message || 'An unexpected file system error occurred.');
+      Alert.alert(
+        'Download Interrupted',
+        err instanceof Error ? err.message : 'An unexpected file system error occurred.'
+      );
     } finally {
       setIsDownloading(false);
     }
@@ -182,7 +231,7 @@ export default function HomeScreen() {
             </Text>
             <Text className="text-slate-400 text-xs">
               {isBoostMode
-                ? 'FastAPI server downloads using parallel chunks then streams to you.'
+                ? 'Celery workers extract and merge your video before streaming it to your device.'
                 : 'Phone downloads directly from CDN in a single background thread.'}
             </Text>
           </View>
@@ -228,7 +277,9 @@ export default function HomeScreen() {
         {isDownloading && (
           <View className="bg-slate-900 border border-indigo-950 p-4 rounded-3xl mb-6">
             <View className="flex-row justify-between items-center mb-2">
-              <Text className="text-white text-xs font-semibold">Downloading Segment Streams...</Text>
+              <Text className="text-white text-xs font-semibold">
+                {isBoostMode ? 'Preparing server download...' : 'Downloading video...'}
+              </Text>
               <Text className="text-indigo-400 text-xs font-bold">{downloadSpeed.toFixed(2)} MB/s</Text>
             </View>
             <View className="w-full h-2 bg-slate-950 rounded-full overflow-hidden mb-2">
