@@ -1,0 +1,31 @@
+{
+  "name": "Monorepo Development Environment",
+  "image": "://microsoft.com",
+
+  "features": {
+    // 1. Installs Python globally
+    "ghcr.io/devcontainers/features/python:1": {
+      "version": "3.12"
+    },
+    // 2. Installs Node.js (includes npm and npx) globally
+    "ghcr.io/devcontainers/features/node:2": {
+      "version": "20"
+    },
+    // 3. Enables Docker daemon inside the container
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {
+      "version": "latest"
+    }
+  },
+
+  // 4. Installs uv globally for the workspace user so it's instantly available everywhere
+  "postCreateCommand": "pip3 install --user uv",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-azuretools.vscode-docker"
+      ]
+    }
+  }
+}

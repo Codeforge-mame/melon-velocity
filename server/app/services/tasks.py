@@ -3,21 +3,31 @@ import logging
 import os
 import re
 import shutil
+import uuid
+from contextlib import ExitStack
 
 import yt_dlp
 
 from app.core.celery_app import celery_app
 from app.core.config import settings
+from app.db import SessionLocal
 from app.services.extractore import VideoExtractorService
+from app.services.social_sessions import temporary_cookie_file
 
 logger = logging.getLogger(__name__)
 FORMAT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=10)
-def download_video_task(self, target_url: str, format_id: str, file_id: str) -> dict[str, str | int]:
+def download_video_task(
+    self, target_url: str, format_id: str, file_id: str, user_id: str | None = None
+) -> dict[str, str | int | None]:
     if not FORMAT_ID_PATTERN.fullmatch(format_id):
         raise ValueError("The selected video format ID is invalid.")
+
+    platform = VideoExtractorService.platform_for_url(target_url)
+    if platform and not user_id:
+        raise ValueError("Please log in to download this video")
 
     task_temp_dir = os.path.join(
         settings.TEMP_DIR,
@@ -27,25 +37,33 @@ def download_video_task(self, target_url: str, format_id: str, file_id: str) -> 
     os.makedirs(task_temp_dir, exist_ok=True)
 
     try:
-        ydl_opts = VideoExtractorService.build_ydl_options()
-        ydl_opts.update(
-            {
-                "format": f"{format_id}+bestaudio/best",
-                "outtmpl": os.path.join(settings.DOWNLOAD_DIR, f"melo_{file_id}.%(ext)s"),
-                "paths": {"temp": task_temp_dir},
-                "merge_output_format": "mp4",
-                "postprocessors": [
-                    {"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}
-                ],
-                "http_chunk_size": 5 * 1024 * 1024,
-                "concurrent_fragment_downloads": 4,
-                "retries": 3,
-                "socket_timeout": 30,
-            }
-        )
+        with ExitStack() as stack:
+            cookie_file = None
+            if platform and user_id:
+                db = stack.enter_context(SessionLocal())
+                cookie_file = stack.enter_context(
+                    temporary_cookie_file(db, uuid.UUID(user_id), platform)
+                )
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(target_url, download=True)
+            ydl_opts = VideoExtractorService.build_ydl_options(cookie_file)
+            ydl_opts.update(
+                {
+                    "format": f"{format_id}+bestaudio/best",
+                    "outtmpl": os.path.join(settings.DOWNLOAD_DIR, f"melo_{file_id}.%(ext)s"),
+                    "paths": {"temp": task_temp_dir},
+                    "merge_output_format": "mp4",
+                    "postprocessors": [
+                        {"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}
+                    ],
+                    "http_chunk_size": 5 * 1024 * 1024,
+                    "concurrent_fragment_downloads": 4,
+                    "retries": 3,
+                    "socket_timeout": 30,
+                }
+            )
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(target_url, download=True)
 
         if not os.path.isfile(output_path):
             reported_path = info.get("filepath") if info else None
@@ -68,6 +86,7 @@ def download_video_task(self, target_url: str, format_id: str, file_id: str) -> 
         return {
             "fileName": os.path.basename(output_path),
             "fileSize": os.path.getsize(output_path),
+            "userId": user_id,
         }
     except Exception as exc:
         logger.exception("Video download task %s failed.", self.request.id)

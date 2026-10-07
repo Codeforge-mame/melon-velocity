@@ -1,22 +1,32 @@
 import os
-from pydantic_settings import BaseSettings
+from typing import Literal
+
+from pydantic import SecretStr
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", case_sensitive=True)
+
     PROJECT_NAME: str = "MeloStream Engine Backend"
     API_V1_STR: str = "/api/v1"
-    
+    DATABASE_URL: str = "postgresql+psycopg://melostream:Mame33@localhost:5432/melostream"
+    REDIS_URL: str = "redis://localhost:6379/2"
+    JWT_SECRET_KEY: SecretStr | None = None
+    SOCIAL_COOKIE_ENCRYPTION_KEY: SecretStr | None = None
+    ACCESS_TOKEN_MINUTES: int = 15
+    REFRESH_TOKEN_DAYS: int = 30
+    AUTH_COOKIE_SECURE: bool = False
+    AUTH_COOKIE_SAMESITE: Literal["lax", "strict", "none"] = "lax"
+    CORS_ORIGINS: str = ""
+
     # Storage allocation directories
     BASE_DIR: str = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     DOWNLOAD_DIR: str = os.path.join(BASE_DIR, "storage", "downloads")
     TEMP_DIR: str = os.path.join(BASE_DIR, "storage", "temp")
-    YTDLP_COOKIE_FILE: str = os.path.join(BASE_DIR, "storage", "cookies.txt")
 
     # Rate limiting configuration
     RATE_LIMIT_MAX_TOKENS: int = 5
     RATE_LIMIT_REFILL_INTERVAL: int = 30  # Refill 1 token every 30 seconds
-
-    class Config:
-        case_sensitive = True
 
 settings = Settings()
 

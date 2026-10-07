@@ -1,13 +1,17 @@
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Literal, Optional
+
+AppMode = Literal["default", "youtube", "telegram", "tiktok"]
 
 class VideoInfoRequest(BaseModel):
     url: str
+    mode: AppMode = "default"
 
 class VideoDownloadRequest(BaseModel):
     url: str
     format_id: str
     resolution: str
+    mode: AppMode = "default"
 
 class FormatPayload(BaseModel):
     formatId: str

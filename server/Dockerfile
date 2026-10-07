@@ -15,6 +15,8 @@ RUN uv sync --frozen --no-dev --no-install-project \
     && uv pip install --python /app/.venv/bin/python --upgrade "yt-dlp[default,curl-cffi]"
 
 COPY app ./app
+COPY alembic.ini ./alembic.ini
+COPY migrations ./migrations
 
 EXPOSE 8000
 

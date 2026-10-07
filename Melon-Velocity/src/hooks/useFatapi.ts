@@ -1,5 +1,5 @@
 import { useQuery } from '@tanstack/react-query';
-import { BACKEND_BASE_URL } from '../constants/config';
+import { useAuth } from '../context/AuthContext';
 
 export interface VideoFormat {
     formatId: string;
@@ -20,14 +20,17 @@ export interface VideoMetadata {
     formats: VideoFormat[];
 }
 
-export function useFastApiMetadata(targetUrl: string) {
+export type VideoAppMode = 'default' | 'youtube' | 'telegram' | 'tiktok';
+
+export function useFastApiMetadata(targetUrl: string, mode: VideoAppMode) {
+    const { apiFetch } = useAuth();
     return useQuery<VideoMetadata, Error>({
-        queryKey: ['fastApiMetadata', targetUrl],
+        queryKey: ['fastApiMetadata', targetUrl, mode],
         queryFn: async () => {
-            const response = await fetch(`${BACKEND_BASE_URL}/info`, {
+            const response = await apiFetch('/info', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ url: targetUrl }),
+                body: JSON.stringify({ url: targetUrl, mode }),
             });
 
             if (!response.ok) {

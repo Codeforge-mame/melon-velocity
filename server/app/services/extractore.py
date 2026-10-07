@@ -1,10 +1,10 @@
 import yt_dlp
 import asyncio
-import os
 from typing import Any
+from urllib.parse import urlparse
 from yt_dlp.networking.impersonate import ImpersonateTarget
 
-from app.core.config import settings
+from app.models import SocialPlatform
 
 # Detect if curl_cffi is available for TLS impersonation (needed for TikTok)
 try:
@@ -15,7 +15,21 @@ except ImportError:
 
 class VideoExtractorService:
     @staticmethod
-    def build_ydl_options() -> dict[str, Any]:
+    def platform_for_url(target_url: str) -> SocialPlatform | None:
+        host = (urlparse(target_url).hostname or "").lower().removeprefix("www.")
+        if host == "youtu.be" or host == "youtube.com" or host.endswith(".youtube.com"):
+            return "youtube"
+        if host == "tiktok.com" or host.endswith(".tiktok.com"):
+            return "tiktok"
+        if host in {"t.me", "telegram.me", "telegram.org", "telegra.ph"} or any(
+            host.endswith(f".{domain}")
+            for domain in ("telegram.me", "telegram.org", "telegra.ph")
+        ):
+            return "telegram"
+        return None
+
+    @staticmethod
+    def build_ydl_options(cookie_file: str | None = None) -> dict[str, Any]:
         ydl_opts: dict[str, Any] = {
             'noplaylist': True,
             'extractor_args': {'youtube': ['player-client=android,ios']},
@@ -24,18 +38,14 @@ class VideoExtractorService:
         if _HAS_CURL_CFFI:
             ydl_opts['impersonate'] = ImpersonateTarget.from_str('chrome-131')
 
-        if os.path.isfile(settings.YTDLP_COOKIE_FILE):
-            ydl_opts['cookiefile'] = settings.YTDLP_COOKIE_FILE
-        elif os.environ.get('YTDLP_COOKIE_FILE'):
-            raise FileNotFoundError(
-                f"Configured yt-dlp cookie file does not exist: {settings.YTDLP_COOKIE_FILE}"
-            )
+        if cookie_file:
+            ydl_opts['cookiefile'] = cookie_file
 
         return ydl_opts
 
     @staticmethod
-    async def extract_metadata(target_url: str) -> dict:
-        ydl_opts = VideoExtractorService.build_ydl_options()
+    async def extract_metadata(target_url: str, cookie_file: str | None = None) -> dict:
+        ydl_opts = VideoExtractorService.build_ydl_options(cookie_file)
 
         loop = asyncio.get_event_loop()
         try:
@@ -62,7 +72,7 @@ class VideoExtractorService:
                     "fileSizeEstimate": f.get("filesize") or f.get("filesize_approx"),
                     "hasVideo": f.get("vcodec") != "none",
                     "hasAudio": f.get("acodec") != "none",
-                    "url": str(f.get("url", ""))
+                    "url": str(f.get("url", "")) if not cookie_file else ""
                 })
                 
         return {

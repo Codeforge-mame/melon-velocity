@@ -1,13 +1,28 @@
-import React, { useState } from 'react';
-import { View, Text, TextInput, TouchableOpacity, Image, ScrollView, ActivityIndicator, Alert, Switch, Platform } from 'react-native';
+import React, { useEffect, useState } from 'react';
+import {
+  ActivityIndicator,
+  Alert,
+  Image,
+  Modal,
+  Platform,
+  ScrollView,
+  Switch,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
+} from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as MediaLibrary from 'expo-media-library';
 import { useRouter } from 'expo-router';
-import { useFastApiMetadata, VideoFormat } from '../hooks/useFatapi';
+import { useFastApiMetadata, VideoAppMode, VideoFormat } from '../hooks/useFatapi';
 import { useLogDownload } from '../hooks/useVideoQueries';
 import { executeDownload as executeSingleThreadDownload } from '../utils/downloadEngine';
 import { BACKEND_BASE_URL } from '../constants/config';
+import { SocialAccount, SocialPlatform, useAuth } from '../context/AuthContext';
+
+type AppMode = VideoAppMode;
 
 interface DownloadQueuedResponse {
   taskId: string;
@@ -20,33 +35,92 @@ interface DownloadStatusResponse {
   error?: string;
 }
 
+const MODES: { id: AppMode; title: string; subtitle: string; accent: string; background: string; surface: string; border: string }[] = [
+  { id: 'default', title: 'Default', subtitle: 'Public links from any supported yt-dlp site', accent: '#818cf8', background: '#090d18', surface: '#111827', border: '#293449' },
+  { id: 'youtube', title: 'YouTube', subtitle: 'YouTube session-based downloads', accent: '#fb4b4b', background: '#190b0d', surface: '#271214', border: '#512126' },
+  { id: 'telegram', title: 'Telegram', subtitle: 'Telegram session-based downloads', accent: '#38bdf8', background: '#08172a', surface: '#10233c', border: '#21466c' },
+  { id: 'tiktok', title: 'TikTok', subtitle: 'TikTok session-based downloads', accent: '#2dd4bf', background: '#071719', surface: '#102426', border: '#1d4a4b' },
+];
+
+const SOCIAL_PLATFORMS: SocialPlatform[] = ['youtube', 'telegram', 'tiktok'];
+const platformLabel = (platform: SocialPlatform) =>
+  platform.charAt(0).toUpperCase() + platform.slice(1);
+
+function isSocialVideoUrl(value: string): boolean {
+  try {
+    const host = new URL(value).hostname.toLowerCase().replace(/^www\./, '');
+    return host === 'youtu.be' || host === 'youtube.com' || host.endsWith('.youtube.com') ||
+      host === 'tiktok.com' || host.endsWith('.tiktok.com') ||
+      ['t.me', 'telegram.me', 'telegram.org', 'telegra.ph'].some(
+        (domain) => host === domain || host.endsWith(`.${domain}`),
+      );
+  } catch {
+    return false;
+  }
+}
+
+async function responseError(response: Response, fallback: string): Promise<string> {
+  try {
+    const body = await response.json() as { detail?: string };
+    return body.detail || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 export default function HomeScreen() {
   const router = useRouter();
+  const { email, apiFetch, ensureAccessToken, login, signUp, logout, saveSocialCookies, deleteSocialAccount, getSocialAccounts } = useAuth();
   const [inputUrl, setInputUrl] = useState('');
   const [searchUrl, setSearchUrl] = useState('');
   const [selectedFormat, setSelectedFormat] = useState<VideoFormat | null>(null);
+  const [mode, setMode] = useState<AppMode>('default');
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [isSignup, setIsSignup] = useState(false);
+  const [accountEmail, setAccountEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [cookiePlatform, setCookiePlatform] = useState<SocialPlatform>('youtube');
+  const [cookieText, setCookieText] = useState('');
+  const [socialAccounts, setSocialAccounts] = useState<SocialAccount[]>([]);
 
-  // Download orchestration states
   const [isBoostMode, setIsBoostMode] = useState(true);
   const [isDownloading, setIsDownloading] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [downloadSpeed, setDownloadSpeed] = useState(0);
 
-  const { data: videoInfo, isLoading, error } = useFastApiMetadata(searchUrl);
+  const activeMode = MODES.find((item) => item.id === mode) ?? MODES[0];
+  const { data: videoInfo, isLoading, error, refetch } = useFastApiMetadata(searchUrl, mode);
   const logDownloadMutation = useLogDownload();
+
+  useEffect(() => {
+    if (!email) return;
+    let active = true;
+    void getSocialAccounts()
+      .then((accounts) => {
+        if (active) setSocialAccounts(accounts);
+      })
+      .catch((err: unknown) => console.error('[MeloStream social account lookup failed]', err));
+    return () => {
+      active = false;
+    };
+  }, [email, getSocialAccounts]);
 
   const handleSearch = () => {
     if (!inputUrl.trim().startsWith('http')) {
       Alert.alert('Invalid URL', 'Please paste a valid video link.');
       return;
     }
+    const targetUrl = inputUrl.trim();
     setSelectedFormat(null);
-    setSearchUrl(inputUrl.trim());
+    if (targetUrl === searchUrl) {
+      void refetch();
+    } else {
+      setSearchUrl(targetUrl);
+    }
   };
 
   const requestGalleryPermission = async (): Promise<void> => {
     if (Platform.OS === 'web') return;
-
     const permission = await MediaLibrary.requestPermissionsAsync(false, ['video']);
     if (!permission.granted) {
       throw new Error('Gallery permission is required to save downloaded videos.');
@@ -55,13 +129,9 @@ export default function HomeScreen() {
 
   const saveToGallery = async (fileUri: string): Promise<string> => {
     if (Platform.OS === 'web') return fileUri;
-
     const album = await MediaLibrary.Album.get('MeloStream');
     const asset = await MediaLibrary.Asset.create(fileUri, album ?? undefined);
-    if (!album) {
-      await MediaLibrary.Album.create('MeloStream', [asset]);
-    }
-
+    if (!album) await MediaLibrary.Album.create('MeloStream', [asset]);
     const galleryUri = await asset.getUri();
     await FileSystem.deleteAsync(fileUri);
     return galleryUri;
@@ -79,32 +149,29 @@ export default function HomeScreen() {
       setDownloadSpeed(0);
       await requestGalleryPermission();
       const downloadStartTime = Date.now();
-
       const appStorageDirectory = FileSystem.documentDirectory ?? FileSystem.cacheDirectory ?? '';
       const localDirectory = `${appStorageDirectory}downloads/`;
-      let finalLocalUri = '';
-
-      // Ensure base storage directory path exists cleanly on hardware disk space
       const dirCheck = await FileSystem.getInfoAsync(localDirectory);
       if (!dirCheck.exists) {
         await FileSystem.makeDirectoryAsync(localDirectory, { intermediates: true });
       }
 
+      const isSocialPlatform = isSocialVideoUrl(videoInfo.sourceUrl);
+      let finalLocalUri = '';
+
       if (isBoostMode) {
-        // --- 🚀 MODE A: FASTAPI CELERY BACKGROUND DOWNLOAD ---
-        const serverResponse = await fetch(`${BACKEND_BASE_URL}/download`, {
+        const serverResponse = await apiFetch('/download', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             url: videoInfo.sourceUrl,
             format_id: selectedFormat.formatId,
             resolution: selectedFormat.resolution,
+            mode,
           }),
         });
-
         if (!serverResponse.ok) {
-          const errData = await serverResponse.json();
-          throw new Error(errData.detail || 'Server-side chunk assembly acceleration failed.');
+          throw new Error(await responseError(serverResponse, 'Server-side download could not be started.'));
         }
 
         const { taskId } = await serverResponse.json() as DownloadQueuedResponse;
@@ -113,74 +180,85 @@ export default function HomeScreen() {
 
         while (!fileName) {
           await new Promise<void>((resolve) => setTimeout(resolve, 1000));
-          const statusResponse = await fetch(
-            `${BACKEND_BASE_URL}/download/${encodeURIComponent(taskId)}`
-          );
+          const statusResponse = await apiFetch(`/download/${encodeURIComponent(taskId)}`);
           if (!statusResponse.ok) {
-            const errData = await statusResponse.json();
-            throw new Error(errData.detail || 'Could not read server download status.');
+            throw new Error(await responseError(statusResponse, 'Could not read server download status.'));
           }
-
           const taskStatus = await statusResponse.json() as DownloadStatusResponse;
           if (taskStatus.status === 'failure') {
             throw new Error(taskStatus.error || 'Server-side video processing failed.');
           }
           if (taskStatus.status === 'success') {
-            if (!taskStatus.fileName) {
-              throw new Error('Server reported success without returning a video file.');
-            }
+            if (!taskStatus.fileName) throw new Error('Server reported success without a video file.');
             fileName = taskStatus.fileName;
           }
         }
 
-        const targetStreamUrl = `${BACKEND_BASE_URL}/stream/${fileName}`;
+        const targetStreamUrl = `${BACKEND_BASE_URL}/stream/${encodeURIComponent(fileName)}`;
         const targetLocalPath = `${localDirectory}${fileName}`;
-
+        const streamToken = isSocialPlatform ? await ensureAccessToken() : null;
+        if (isSocialPlatform && !streamToken) {
+          throw new Error('Please log in to download this video');
+        }
         const downloadTask = FileSystem.createDownloadResumable(
           targetStreamUrl,
           targetLocalPath,
-          { headers: { 'Connection': 'keep-alive' } },
+          {
+            headers: {
+              Connection: 'keep-alive',
+              ...(streamToken ? { Authorization: `Bearer ${streamToken}` } : {}),
+            },
+          },
           (progress) => {
             const written = progress.totalBytesWritten;
             const expected = progress.totalBytesExpectedToWrite;
             const percent = expected > 0 ? (written / expected) * 100 : 0;
             const elapsed = (Date.now() - downloadStartTime) / 1000;
-            const currentSpeed = elapsed > 0 ? (written / (1024 * 1024)) / elapsed : 0;
-
             setDownloadProgress(Math.min(percent, 100));
-            setDownloadSpeed(currentSpeed);
-          }
+            setDownloadSpeed(elapsed > 0 ? (written / (1024 * 1024)) / elapsed : 0);
+          },
         );
-
         const result = await downloadTask.downloadAsync();
         if (!result?.uri) throw new Error('File delivery network stream aborted.');
         finalLocalUri = result.uri;
-
+      } else if (isSocialPlatform) {
+        const directToken = await ensureAccessToken();
+        if (!directToken) throw new Error('Please log in to download this video');
+        const directUrl = `${BACKEND_BASE_URL}/download/direct?url=${encodeURIComponent(videoInfo.sourceUrl)}&format_id=${encodeURIComponent(selectedFormat.formatId)}&mode=${mode}`;
+        const downloadTask = FileSystem.createDownloadResumable(
+          directUrl,
+          `${localDirectory}melo_${Date.now()}.mp4`,
+          { headers: { Authorization: `Bearer ${directToken}` } },
+          (progress) => {
+            const written = progress.totalBytesWritten;
+            const expected = progress.totalBytesExpectedToWrite;
+            const elapsed = (Date.now() - downloadStartTime) / 1000;
+            setDownloadProgress(expected > 0 ? Math.min((written / expected) * 100, 100) : 0);
+            setDownloadSpeed(elapsed > 0 ? (written / (1024 * 1024)) / elapsed : 0);
+          },
+        );
+        const result = await downloadTask.downloadAsync();
+        if (!result?.uri) throw new Error('Authenticated video stream aborted.');
+        finalLocalUri = result.uri;
       } else {
-        // --- 📱 MODE B: SINGLE-STREAM DIRECT PHONE DOWNLOAD ---
-        const generatedFileName = `melo_${Date.now()}.${selectedFormat.extension}`;
         const resultUri = await executeSingleThreadDownload({
           videoUrl: selectedFormat.url,
-          fileName: generatedFileName,
+          fileName: `melo_${Date.now()}.${selectedFormat.extension}`,
           onProgress: (progress) => {
             setDownloadProgress(progress.progressPercent);
             setDownloadSpeed(progress.downloadSpeedMBs);
-          }
+          },
         });
-
         if (!resultUri) throw new Error('Local background file storage stream aborted.');
         finalLocalUri = resultUri;
       }
 
-      // Save to device gallery/My Files so it's accessible outside the app
       const localFileInfo = await FileSystem.getInfoAsync(finalLocalUri);
       const downloadedFileSize =
         localFileInfo.exists && typeof localFileInfo.size === 'number'
           ? localFileInfo.size
           : selectedFormat.fileSizeEstimate ?? 0;
       finalLocalUri = await saveToGallery(finalLocalUri);
-
-      // Record in local SQLite history database
       await logDownloadMutation.mutateAsync({
         title: videoInfo.title,
         url: videoInfo.sourceUrl,
@@ -189,66 +267,91 @@ export default function HomeScreen() {
         resolution: selectedFormat.resolution,
         thumbnail: videoInfo.thumbnail,
       });
-
-      Alert.alert(
-        'Download Complete ✨',
-        'Video saved to your device and MeloStream library!',
-      );
-
+      Alert.alert('Download Complete', 'Video saved to your device and MeloStream library!');
     } catch (err: unknown) {
       console.error('[MeloStream Download Runtime Interrupted]:', err);
       Alert.alert(
         'Download Interrupted',
-        err instanceof Error ? err.message : 'An unexpected file system error occurred.'
+        err instanceof Error ? err.message : 'An unexpected file system error occurred.',
       );
     } finally {
       setIsDownloading(false);
     }
   };
 
+  const handleAccountSubmit = async () => {
+    try {
+      if (isSignup) await signUp(accountEmail.trim(), password);
+      else await login(accountEmail.trim(), password);
+      setPassword('');
+      Alert.alert(isSignup ? 'Account Created' : 'Signed In', 'Your MeloStream account is ready.');
+    } catch (err: unknown) {
+      Alert.alert('Account Error', err instanceof Error ? err.message : 'Could not sign in.');
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await logout();
+      setSocialAccounts([]);
+    } catch (err: unknown) {
+      Alert.alert('Sign Out Error', err instanceof Error ? err.message : 'Could not sign out.');
+    }
+  };
+
+  const handleSaveCookies = async () => {
+    try {
+      await saveSocialCookies(cookiePlatform, cookieText.trim());
+      setCookieText('');
+      setSocialAccounts(await getSocialAccounts());
+      Alert.alert('Session Saved', `${platformLabel(cookiePlatform)} cookies were encrypted and saved.`);
+    } catch (err: unknown) {
+      Alert.alert('Could Not Save Session', err instanceof Error ? err.message : 'Try again.');
+    }
+  };
+
+  const handleRemoveCookies = async (platform: SocialPlatform) => {
+    try {
+      await deleteSocialAccount(platform);
+      setSocialAccounts(await getSocialAccounts());
+    } catch (err: unknown) {
+      Alert.alert('Could Not Remove Session', err instanceof Error ? err.message : 'Try again.');
+    }
+  };
+
   return (
-    <SafeAreaView className="flex-1 bg-slate-950 px-4 pt-4">
-      {/* APP TITLE ACTION HEADER */}
+    <SafeAreaView className="flex-1 px-4 pt-4" style={{ backgroundColor: activeMode.background }}>
       <View className="flex-row justify-between items-center mb-6">
         <View>
           <Text className="text-2xl font-black text-white tracking-tight">MeloStream</Text>
-          <Text className="text-xs text-slate-400">High-Velocity Media Library</Text>
+          <Text style={{ color: activeMode.accent }} className="text-xs font-semibold">
+            {activeMode.title} Mode · High-Velocity Media Library
+          </Text>
         </View>
-        <TouchableOpacity
-          onPress={() => router.push('/history')}
-          className="bg-slate-900 border border-slate-800 px-4 py-2 rounded-full"
-        >
-          <Text className="text-indigo-400 text-xs font-bold">Library History</Text>
-        </TouchableOpacity>
+        <View className="flex-row items-center gap-2">
+          <TouchableOpacity
+            onPress={() => router.push('/history')}
+            className="px-3 py-2 rounded-full"
+            style={{ backgroundColor: activeMode.surface, borderColor: activeMode.border, borderWidth: 1 }}
+          >
+            <Text style={{ color: activeMode.accent }} className="text-xs font-bold">History</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            accessibilityLabel="Open sidebar settings"
+            onPress={() => setSettingsOpen(true)}
+            className="px-3 py-2 rounded-full"
+            style={{ backgroundColor: activeMode.surface, borderColor: activeMode.border, borderWidth: 1 }}
+          >
+            <Text className="text-white text-base font-bold">☰</Text>
+          </TouchableOpacity>
+        </View>
       </View>
 
       <ScrollView showsVerticalScrollIndicator={false} className="flex-1">
-        {/* DUAL MODE ENGINE TOGGLE SWITCH */}
-        <View className="bg-slate-900 border border-slate-800 p-4 rounded-3xl mb-4 flex-row justify-between items-center">
-          <View className="flex-1 pr-4">
-            <Text className="text-white font-bold text-sm mb-0.5">
-              {isBoostMode ? '🚀 Server Boost Mode' : '📱 Phone Direct Mode'}
-            </Text>
-            <Text className="text-slate-400 text-xs">
-              {isBoostMode
-                ? 'Celery workers extract and merge your video before streaming it to your device.'
-                : 'Phone downloads directly from CDN in a single background thread.'}
-            </Text>
-          </View>
-          <Switch
-            trackColor={{ false: '#334155', true: '#4f46e5' }}
-            thumbColor={isBoostMode ? '#10b981' : '#94a3b8'}
-            value={isBoostMode}
-            onValueChange={setIsBoostMode}
-            disabled={isDownloading}
-          />
-        </View>
-
-        {/* DESTINATION SEARCH BAR INPUT CARD */}
-        <View className="bg-slate-900 border border-slate-800 p-4 rounded-3xl mb-6">
+        <View className="p-4 rounded-3xl mb-6" style={{ backgroundColor: activeMode.surface, borderColor: activeMode.border, borderWidth: 1 }}>
           <Text className="text-slate-300 text-sm font-medium mb-2">Paste Video Destination Link</Text>
           <TextInput
-            placeholder="TikTok, YouTube, Custom URL..."
+            placeholder="YouTube, Telegram, TikTok, or public URL"
             placeholderTextColor="#64748b"
             value={inputUrl}
             onChangeText={setInputUrl}
@@ -260,38 +363,43 @@ export default function HomeScreen() {
           <TouchableOpacity
             onPress={handleSearch}
             disabled={isLoading || isDownloading}
-            className="bg-indigo-600 active:bg-indigo-700 disabled:opacity-50 py-3 rounded-xl flex-row justify-center items-center"
+            className="disabled:opacity-50 py-3 rounded-xl flex-row justify-center items-center"
+            style={{ backgroundColor: activeMode.accent }}
           >
-            {isLoading ? <ActivityIndicator color="#fff" size="small" /> : <Text className="text-white font-bold text-sm">Analyze Media Stream</Text>}
+            {isLoading
+              ? <ActivityIndicator color="#fff" size="small" />
+              : <Text className="text-slate-950 font-bold text-sm">Analyze Media Stream</Text>}
           </TouchableOpacity>
+          {!email && (
+            <Text className="text-slate-400 text-xs mt-3 text-center">
+              Choose the matching platform mode and sign in before analyzing YouTube, Telegram, or TikTok links.
+            </Text>
+          )}
         </View>
 
-        {/* ERROR STATUS CARD COMPONENT */}
         {error && (
           <View className="bg-rose-950/30 border border-rose-900 p-4 rounded-2xl mb-6">
-            <Text className="text-rose-400 text-sm text-center font-medium">{error.message || 'Error communicating with analyzer.'}</Text>
+            <Text className="text-rose-400 text-sm text-center font-medium">{error.message}</Text>
           </View>
         )}
 
-        {/* PROGRESS METRICS INFOCARD BAR PANEL */}
         {isDownloading && (
-          <View className="bg-slate-900 border border-indigo-950 p-4 rounded-3xl mb-6">
+          <View className="p-4 rounded-3xl mb-6" style={{ backgroundColor: activeMode.surface, borderColor: activeMode.border, borderWidth: 1 }}>
             <View className="flex-row justify-between items-center mb-2">
               <Text className="text-white text-xs font-semibold">
                 {isBoostMode ? 'Preparing server download...' : 'Downloading video...'}
               </Text>
-              <Text className="text-indigo-400 text-xs font-bold">{downloadSpeed.toFixed(2)} MB/s</Text>
+              <Text style={{ color: activeMode.accent }} className="text-xs font-bold">{downloadSpeed.toFixed(2)} MB/s</Text>
             </View>
             <View className="w-full h-2 bg-slate-950 rounded-full overflow-hidden mb-2">
-              <View className="h-full bg-indigo-500 rounded-full" style={{ width: `${downloadProgress}%` }} />
+              <View className="h-full rounded-full" style={{ width: `${downloadProgress}%`, backgroundColor: activeMode.accent }} />
             </View>
             <Text className="text-right text-slate-400 text-[10px]">{downloadProgress.toFixed(1)}% Completed</Text>
           </View>
         )}
 
-        {/* DISPLAY COMPONENT PARSING INTERACTION METADATA */}
         {videoInfo && (
-          <View className="bg-slate-900 border border-slate-800 rounded-3xl p-4 mb-6">
+          <View className="rounded-3xl p-4 mb-6" style={{ backgroundColor: activeMode.surface, borderColor: activeMode.border, borderWidth: 1 }}>
             <Image
               source={{ uri: videoInfo.thumbnail || 'https://placeholder.com' }}
               className="w-full h-48 rounded-2xl mb-4 bg-slate-950"
@@ -299,69 +407,216 @@ export default function HomeScreen() {
             />
             <Text className="text-white font-bold text-base mb-1" numberOfLines={2}>{videoInfo.title}</Text>
             <Text className="text-slate-400 text-xs mb-4">By {videoInfo.uploader || 'Unknown Origin Creator'}</Text>
-
-            {/* Quality / Format Selection List */}
             <Text className="text-slate-300 font-semibold text-xs mb-3">SELECT QUALITY / FORMAT</Text>
             <View className="gap-2 mb-4">
-              {videoInfo.formats && videoInfo.formats.length > 0 ? (
-                videoInfo.formats.map((fmt) => {
-                  const isSelected = selectedFormat?.formatId === fmt.formatId;
-                  const sizeMB = fmt.fileSizeEstimate ? (fmt.fileSizeEstimate / (1024 * 1024)).toFixed(1) : null;
-                  return (
-                    <TouchableOpacity
-                      key={fmt.formatId}
-                      onPress={() => setSelectedFormat(fmt)}
-                      disabled={isDownloading}
-                      className={`p-3 rounded-2xl border flex-row justify-between items-center ${
-                        isSelected
-                          ? 'bg-indigo-950/70 border-indigo-500'
-                          : 'bg-slate-950/60 border-slate-800'
-                      }`}
-                    >
-                      <View className="flex-1 mr-2">
-                        <View className="flex-row items-center gap-2">
-                          <Text className="text-white font-bold text-xs">{fmt.resolution}</Text>
-                          <Text className="text-slate-400 text-[10px] uppercase font-mono">{fmt.extension}</Text>
-                          {fmt.hasAudio && !fmt.hasVideo && (
-                            <Text className="text-emerald-400 text-[10px] bg-emerald-950 px-1.5 py-0.5 rounded">Audio Only</Text>
-                          )}
-                        </View>
-                        <Text className="text-slate-500 text-[10px] mt-0.5">
-                          {sizeMB ? `~${sizeMB} MB` : 'Dynamic Size'}
-                        </Text>
+              {videoInfo.formats?.length ? videoInfo.formats.map((format) => {
+                const selected = selectedFormat?.formatId === format.formatId;
+                const sizeMB = format.fileSizeEstimate
+                  ? (format.fileSizeEstimate / (1024 * 1024)).toFixed(1)
+                  : null;
+                return (
+                  <TouchableOpacity
+                    key={format.formatId}
+                    onPress={() => setSelectedFormat(format)}
+                    disabled={isDownloading}
+                    className="p-3 rounded-2xl border flex-row justify-between items-center"
+                    style={{
+                      backgroundColor: selected ? `${activeMode.accent}20` : '#080d17',
+                      borderColor: selected ? activeMode.accent : activeMode.border,
+                    }}
+                  >
+                    <View className="flex-1 mr-2">
+                      <View className="flex-row items-center gap-2">
+                        <Text className="text-white font-bold text-xs">{format.resolution}</Text>
+                        <Text className="text-slate-400 text-[10px] uppercase font-mono">{format.extension}</Text>
+                        {format.hasAudio && !format.hasVideo && (
+                          <Text className="text-emerald-400 text-[10px] bg-emerald-950 px-1.5 py-0.5 rounded">Audio Only</Text>
+                        )}
                       </View>
-                      <View
-                        className={`w-5 h-5 rounded-full border items-center justify-center ${
-                          isSelected ? 'border-indigo-400 bg-indigo-600' : 'border-slate-700'
-                        }`}
-                      >
-                        {isSelected && <View className="w-2 h-2 rounded-full bg-white" />}
-                      </View>
-                    </TouchableOpacity>
-                  );
-                })
-              ) : (
-                <Text className="text-slate-500 text-xs">No explicit stream formats available.</Text>
-              )}
+                      <Text className="text-slate-500 text-[10px] mt-0.5">{sizeMB ? `~${sizeMB} MB` : 'Dynamic Size'}</Text>
+                    </View>
+                    <View className="w-5 h-5 rounded-full border items-center justify-center" style={{ borderColor: activeMode.accent }}>
+                      {selected && <View className="w-2 h-2 rounded-full" style={{ backgroundColor: activeMode.accent }} />}
+                    </View>
+                  </TouchableOpacity>
+                );
+              }) : <Text className="text-slate-500 text-xs">No explicit stream formats available.</Text>}
             </View>
-
-            {/* Trigger Download Button */}
             <TouchableOpacity
               onPress={handleDownload}
               disabled={!selectedFormat || isDownloading}
-              className="bg-emerald-600 active:bg-emerald-700 disabled:opacity-40 py-3.5 rounded-2xl flex-row justify-center items-center shadow-lg"
+              className="disabled:opacity-50 py-3 rounded-xl items-center"
+              style={{ backgroundColor: activeMode.accent }}
             >
-              {isDownloading ? (
-                <ActivityIndicator color="#fff" size="small" />
-              ) : (
-                <Text className="text-white font-bold text-sm">
-                  {selectedFormat ? `Download ${selectedFormat.resolution}` : 'Select a format to download'}
-                </Text>
-              )}
+              <Text className="text-slate-950 font-bold text-sm">
+                {isBoostMode ? '🚀 Start Server Boost Download' : '📱 Start Phone Direct Download'}
+              </Text>
             </TouchableOpacity>
           </View>
         )}
       </ScrollView>
+
+      <Modal
+        visible={settingsOpen}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setSettingsOpen(false)}
+      >
+        <View className="flex-1 flex-row bg-black/60">
+          <View className="w-[88%] max-w-[380px] bg-slate-950 px-5 pt-14 pb-8 border-r border-slate-800">
+            <View className="flex-row items-center justify-between mb-5">
+              <View>
+                <Text className="text-white text-xl font-black">Sidebar Settings</Text>
+                <Text className="text-slate-400 text-xs mt-1">Mode, download engine & account</Text>
+              </View>
+              <TouchableOpacity onPress={() => setSettingsOpen(false)} className="px-3 py-2 rounded-xl bg-slate-900">
+                <Text className="text-white font-bold">✕</Text>
+              </TouchableOpacity>
+            </View>
+
+            <ScrollView showsVerticalScrollIndicator={false}>
+              <Text className="text-slate-300 font-bold text-xs mb-2">APP MODE</Text>
+              <View className="gap-2 mb-5">
+                {MODES.map((item) => (
+                  <TouchableOpacity
+                    key={item.id}
+                    onPress={() => setMode(item.id)}
+                    className="p-3 rounded-2xl border"
+                    style={{
+                      backgroundColor: item.id === mode ? `${item.accent}1c` : '#111827',
+                      borderColor: item.id === mode ? item.accent : '#263244',
+                    }}
+                  >
+                    <Text style={{ color: item.accent }} className="font-bold text-sm">{item.title}</Text>
+                    <Text className="text-slate-400 text-[11px] mt-1">{item.subtitle}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+
+              <View className="bg-slate-900 border border-slate-800 p-4 rounded-2xl mb-5">
+                <View className="flex-row justify-between items-center">
+                  <View className="flex-1 pr-3">
+                    <Text className="text-white font-bold text-sm">
+                      {isBoostMode ? 'Server Boost' : 'Phone Direct'}
+                    </Text>
+                    <Text className="text-slate-400 text-xs mt-1">
+                      {isBoostMode
+                        ? 'Queue extraction and merge on the server.'
+                        : 'Download through Expo; private-platform cookies remain on the server.'}
+                    </Text>
+                  </View>
+                  <Switch
+                    trackColor={{ false: '#334155', true: activeMode.accent }}
+                    thumbColor={isBoostMode ? '#fff' : '#94a3b8'}
+                    value={isBoostMode}
+                    onValueChange={setIsBoostMode}
+                    disabled={isDownloading}
+                  />
+                </View>
+              </View>
+
+              <Text className="text-slate-300 font-bold text-xs mb-2">ACCOUNT</Text>
+              {email ? (
+                <View className="bg-slate-900 border border-slate-800 p-4 rounded-2xl mb-5">
+                  <Text className="text-slate-400 text-xs">Signed in as</Text>
+                  <Text className="text-white font-bold mt-1 mb-3">{email}</Text>
+                  <TouchableOpacity onPress={handleLogout} className="bg-rose-950 border border-rose-900 rounded-xl py-2.5 items-center">
+                    <Text className="text-rose-300 text-xs font-bold">Sign Out</Text>
+                  </TouchableOpacity>
+                </View>
+              ) : (
+                <View className="bg-slate-900 border border-slate-800 p-4 rounded-2xl mb-5">
+                  <View className="flex-row gap-2 mb-3">
+                    <TouchableOpacity onPress={() => setIsSignup(false)} className={`flex-1 py-2 rounded-lg ${!isSignup ? 'bg-indigo-600' : 'bg-slate-800'}`}>
+                      <Text className="text-white text-center text-xs font-bold">Log In</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity onPress={() => setIsSignup(true)} className={`flex-1 py-2 rounded-lg ${isSignup ? 'bg-indigo-600' : 'bg-slate-800'}`}>
+                      <Text className="text-white text-center text-xs font-bold">Sign Up</Text>
+                    </TouchableOpacity>
+                  </View>
+                  <TextInput
+                    value={accountEmail}
+                    onChangeText={setAccountEmail}
+                    placeholder="Email"
+                    placeholderTextColor="#64748b"
+                    keyboardType="email-address"
+                    autoCapitalize="none"
+                    className="bg-slate-950 border border-slate-800 text-white rounded-xl px-3 py-3 text-sm mb-2"
+                  />
+                  <TextInput
+                    value={password}
+                    onChangeText={setPassword}
+                    placeholder={isSignup ? 'Password (10+ characters)' : 'Password'}
+                    placeholderTextColor="#64748b"
+                    secureTextEntry
+                    className="bg-slate-950 border border-slate-800 text-white rounded-xl px-3 py-3 text-sm mb-3"
+                  />
+                  <TouchableOpacity onPress={handleAccountSubmit} className="rounded-xl py-3 items-center" style={{ backgroundColor: activeMode.accent }}>
+                    <Text className="text-slate-950 font-bold text-sm">{isSignup ? 'Create Account' : 'Log In'}</Text>
+                  </TouchableOpacity>
+                </View>
+              )}
+
+              {email && (
+                <>
+                  <Text className="text-slate-300 font-bold text-xs mb-1">SOCIAL SESSION COOKIES</Text>
+                  <Text className="text-slate-500 text-[11px] mb-3">
+                    Paste Netscape-format cookies exported from your own account. They are encrypted before storage.
+                  </Text>
+                  {SOCIAL_PLATFORMS.map((platform) => {
+                    const saved = socialAccounts.some((account) => account.platform === platform);
+                    return (
+                      <View key={platform} className="bg-slate-900 border border-slate-800 p-3 rounded-xl mb-2 flex-row justify-between items-center">
+                        <View>
+                          <Text className="text-white font-bold text-xs">{platformLabel(platform)}</Text>
+                          <Text className={`text-[10px] mt-1 ${saved ? 'text-emerald-400' : 'text-slate-500'}`}>
+                            {saved ? 'Session saved' : 'No session saved'}
+                          </Text>
+                        </View>
+                        {saved && (
+                          <TouchableOpacity onPress={() => handleRemoveCookies(platform)} className="px-2 py-1 rounded-lg bg-rose-950">
+                            <Text className="text-rose-300 text-[10px] font-bold">Remove</Text>
+                          </TouchableOpacity>
+                        )}
+                      </View>
+                    );
+                  })}
+                  <View className="flex-row gap-2 my-2">
+                    {SOCIAL_PLATFORMS.map((platform) => (
+                      <TouchableOpacity
+                        key={platform}
+                        onPress={() => setCookiePlatform(platform)}
+                        className={`flex-1 rounded-lg py-2 ${cookiePlatform === platform ? 'bg-indigo-600' : 'bg-slate-800'}`}
+                      >
+                        <Text className="text-white text-[10px] text-center font-bold">{platformLabel(platform)}</Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                  <TextInput
+                    value={cookieText}
+                    onChangeText={setCookieText}
+                    placeholder="# Netscape HTTP Cookie File&#10;.youtube.com TRUE / TRUE 0 SID ..."
+                    placeholderTextColor="#64748b"
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                    multiline
+                    textAlignVertical="top"
+                    className="bg-slate-950 border border-slate-800 text-white rounded-xl px-3 py-3 text-xs h-32 mb-2"
+                  />
+                  <TouchableOpacity onPress={handleSaveCookies} className="bg-slate-800 rounded-xl py-3 items-center mb-5">
+                    <Text className="text-white font-bold text-xs">Encrypt & Save {platformLabel(cookiePlatform)} Session</Text>
+                  </TouchableOpacity>
+                </>
+              )}
+            </ScrollView>
+          </View>
+          <TouchableOpacity
+            accessibilityLabel="Close settings"
+            onPress={() => setSettingsOpen(false)}
+            className="flex-1"
+          />
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
