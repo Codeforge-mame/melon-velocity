@@ -14,9 +14,10 @@ docker compose up --build
 ```
 
 The API is available on port `8000`. PostgreSQL data is persisted in the
-`postgres_data` Compose volume. The `migrate` service applies Alembic revisions
-before the API and worker start. The API and worker share `app/storage` for
-completed video files and temporary extraction data.
+`postgres_data` Compose volume. The API and worker share `app/storage` for
+completed video files and temporary extraction data. Compose does not run
+database migrations; apply them manually with `uv run alembic upgrade head`
+from this directory after PostgreSQL is available.
 
 For production, use distinct strong secrets, set `AUTH_COOKIE_SECURE=true`,
 configure `CORS_ORIGINS` to explicit trusted web origins, and use HTTPS. If the

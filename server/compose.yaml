@@ -21,28 +21,19 @@ services:
       timeout: 3s
       retries: 10
 
-  # migrate:
-  #   build: .
-  #   command: ["uv", "run", "--no-sync", "alembic", "upgrade", "head"]
-  #   environment: &app_environment
-  #     DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://melostream:${POSTGRES_PASSWORD:-melostream}@postgres:5432/melostream}
-  #     REDIS_URL: redis://redis:6379/2
-  #     JWT_SECRET_KEY: ${JWT_SECRET_KEY:?Set JWT_SECRET_KEY in your environment}
-  #     SOCIAL_COOKIE_ENCRYPTION_KEY: ${SOCIAL_COOKIE_ENCRYPTION_KEY:?Set SOCIAL_COOKIE_ENCRYPTION_KEY in your environment}
-  #     AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-false}
-  #     AUTH_COOKIE_SAMESITE: ${AUTH_COOKIE_SAMESITE:-lax}
-  #     CORS_ORIGINS: ${CORS_ORIGINS:-}
-  #   depends_on:
-  #     postgres:
-  #       condition: service_healthy
-
   api:
     build: .
     command: ["uv", "run", "--no-sync", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
     ports:
       - "8000:8000"
     environment:
-      <<: *app_environment
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://melostream:${POSTGRES_PASSWORD:-melostream}@postgres:5432/melostream}
+      REDIS_URL: redis://redis:6379/2
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?Set JWT_SECRET_KEY in your environment}
+      SOCIAL_COOKIE_ENCRYPTION_KEY: ${SOCIAL_COOKIE_ENCRYPTION_KEY:?Set SOCIAL_COOKIE_ENCRYPTION_KEY in your environment}
+      AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-false}
+      AUTH_COOKIE_SAMESITE: ${AUTH_COOKIE_SAMESITE:-lax}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/1
     volumes:
@@ -50,14 +41,20 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-      migrate:
-        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
 
   worker:
     build: .
     command: ["uv", "run", "--no-sync", "celery", "-A", "app.core.celery_app:celery_app", "worker", "--loglevel=INFO", "--concurrency=4"]
     environment:
-      <<: *app_environment
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://melostream:${POSTGRES_PASSWORD:-melostream}@postgres:5432/melostream}
+      REDIS_URL: redis://redis:6379/2
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?Set JWT_SECRET_KEY in your environment}
+      SOCIAL_COOKIE_ENCRYPTION_KEY: ${SOCIAL_COOKIE_ENCRYPTION_KEY:?Set SOCIAL_COOKIE_ENCRYPTION_KEY in your environment}
+      AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-false}
+      AUTH_COOKIE_SAMESITE: ${AUTH_COOKIE_SAMESITE:-lax}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/1
     volumes:
@@ -65,8 +62,8 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-      migrate:
-        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
 
 volumes:
   postgres_data:
