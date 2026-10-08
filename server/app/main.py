@@ -1,12 +1,31 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from redis.asyncio import Redis as AsyncRedis
+
 from app.core.config import settings
 from app.core.middlware import RateLimitMiddleware
 from app.api.routes import router as api_router
 from app.api.auth import router as auth_router
 
+
 def create_app() -> FastAPI:
-    application = FastAPI(title=settings.PROJECT_NAME, version="1.0.0")
+    @asynccontextmanager
+    async def lifespan(application: FastAPI):
+        redis_client = AsyncRedis.from_url(settings.REDIS_URL)
+        try:
+            await redis_client.ping()
+            application.state.rate_limit_redis = redis_client
+            yield
+        finally:
+            await redis_client.aclose()
+
+    application = FastAPI(
+        title=settings.PROJECT_NAME,
+        version="1.0.0",
+        lifespan=lifespan,
+    )
     application.add_middleware(RateLimitMiddleware)
     application.add_middleware(
         CORSMiddleware,

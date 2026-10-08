@@ -1,10 +1,14 @@
+import base64
+import binascii
 import os
 import tempfile
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 
+from cryptography.exceptions import InvalidTag
 from cryptography.fernet import Fernet, InvalidToken
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -16,16 +20,48 @@ class SocialAccountMissingError(Exception):
     pass
 
 
-def _fernet() -> Fernet:
+def _encryption_keys() -> tuple[str, bytes]:
     if not settings.SOCIAL_COOKIE_ENCRYPTION_KEY:
         raise RuntimeError(
             "SOCIAL_COOKIE_ENCRYPTION_KEY must be configured before storing or using social cookies."
         )
-    return Fernet(settings.SOCIAL_COOKIE_ENCRYPTION_KEY.get_secret_value().encode("ascii"))
+    encoded_key = settings.SOCIAL_COOKIE_ENCRYPTION_KEY.get_secret_value()
+    try:
+        key = base64.urlsafe_b64decode(encoded_key.encode("ascii"))
+    except (UnicodeEncodeError, binascii.Error) as exc:
+        raise RuntimeError("SOCIAL_COOKIE_ENCRYPTION_KEY must be a valid Fernet-format key.") from exc
+    if len(key) != 32 or base64.urlsafe_b64encode(key).decode("ascii") != encoded_key:
+        raise RuntimeError("SOCIAL_COOKIE_ENCRYPTION_KEY must decode to exactly 32 bytes.")
+    return encoded_key, key
 
 
 def encrypt_cookies(cookies: str) -> str:
-    return _fernet().encrypt(cookies.encode("utf-8")).decode("ascii")
+    _, key = _encryption_keys()
+    nonce = os.urandom(12)
+    ciphertext = AESGCM(key).encrypt(nonce, cookies.encode("utf-8"), None)
+    token = base64.urlsafe_b64encode(nonce + ciphertext).decode("ascii")
+    return f"v2:{token}"
+
+
+def _decrypt_cookies(encrypted_cookies: str) -> bytes:
+    encoded_key, key = _encryption_keys()
+    if encrypted_cookies.startswith("v2:"):
+        try:
+            token = base64.urlsafe_b64decode(encrypted_cookies[3:].encode("ascii"))
+            if len(token) < 12 + 16:
+                raise ValueError("The encrypted cookie payload is incomplete.")
+            return AESGCM(key).decrypt(token[:12], token[12:], None)
+        except (InvalidTag, ValueError, UnicodeEncodeError, binascii.Error) as exc:
+            raise RuntimeError(
+                "Saved social cookies could not be decrypted; verify SOCIAL_COOKIE_ENCRYPTION_KEY."
+            ) from exc
+
+    try:
+        return Fernet(encoded_key.encode("ascii")).decrypt(encrypted_cookies.encode("ascii"))
+    except (InvalidToken, UnicodeEncodeError) as exc:
+        raise RuntimeError(
+            "Saved social cookies could not be decrypted; verify SOCIAL_COOKIE_ENCRYPTION_KEY."
+        ) from exc
 
 
 @contextmanager
@@ -43,12 +79,7 @@ def temporary_cookie_file(
             f"No {platform} session cookies are saved for this account."
         )
 
-    try:
-        cookies = _fernet().decrypt(account.encrypted_cookies.encode("ascii"))
-    except InvalidToken as exc:
-        raise RuntimeError(
-            "Saved social cookies could not be decrypted; verify SOCIAL_COOKIE_ENCRYPTION_KEY."
-        ) from exc
+    cookies = _decrypt_cookies(account.encrypted_cookies)
 
     file_descriptor, cookie_path = tempfile.mkstemp(prefix="melostream-cookies-", suffix=".txt")
     try:

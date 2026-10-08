@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:17-alpine
+    image: postgres:16-alpine
     environment:
       POSTGRES_DB: melostream
       POSTGRES_USER: melostream
@@ -46,7 +46,7 @@ services:
 
   worker:
     build: .
-    command: ["uv", "run", "--no-sync", "celery", "-A", "app.core.celery_app:celery_app", "worker", "--loglevel=INFO", "--concurrency=4"]
+    command: ["uv", "run", "--no-sync", "celery", "-A", "app.core.celery_app:celery_app", "worker", "--loglevel=INFO"]
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://melostream:${POSTGRES_PASSWORD:-melostream}@postgres:5432/melostream}
       REDIS_URL: redis://redis:6379/2

@@ -1,6 +1,7 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  AppState,
   Alert,
   Image,
   Modal,
@@ -15,10 +16,21 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as MediaLibrary from 'expo-media-library';
-import { useRouter } from 'expo-router';
+import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useFastApiMetadata, VideoAppMode, VideoFormat } from '../hooks/useFatapi';
-import { useLogDownload } from '../hooks/useVideoQueries';
-import { executeDownload as executeSingleThreadDownload } from '../utils/downloadEngine';
+import {
+  useActiveDownloadCount,
+  useDownloadHistory,
+  useLogDownload,
+  useUpdateDownload,
+} from '../hooks/useVideoQueries';
+import { DownloadRecord } from '../context/DbContext';
+import {
+  clearDownloadCancellation,
+  isDownloadCancelled,
+  pauseActiveDownload,
+  registerDownloadControls,
+} from '../utils/downloadControls';
 import { BACKEND_BASE_URL } from '../constants/config';
 import { SocialAccount, SocialPlatform, useAuth } from '../context/AuthContext';
 
@@ -26,10 +38,11 @@ type AppMode = VideoAppMode;
 
 interface DownloadQueuedResponse {
   taskId: string;
+  cancellationToken: string;
 }
 
 interface DownloadStatusResponse {
-  status: 'queued' | 'processing' | 'retrying' | 'success' | 'failure';
+  status: 'queued' | 'processing' | 'retrying' | 'success' | 'failure' | 'cancelled';
   fileName?: string;
   fileSize?: number;
   error?: string;
@@ -69,12 +82,27 @@ async function responseError(response: Response, fallback: string): Promise<stri
 }
 
 export default function HomeScreen() {
+  const routeParams = useLocalSearchParams<{ retryId?: string }>();
+  const { data: history = [] } = useDownloadHistory();
+  const retryId = routeParams.retryId;
+  const initialRecord = retryId
+    ? history.find((item) => item.id === Number(retryId))
+    : undefined;
+  const contentKey = retryId
+    ? initialRecord
+      ? `retry-${initialRecord.id}`
+      : `retry-pending-${retryId}`
+    : 'home';
+  return <HomeScreenContent key={contentKey} initialRecord={initialRecord} />;
+}
+
+function HomeScreenContent({ initialRecord }: { initialRecord?: DownloadRecord }) {
   const router = useRouter();
   const { email, apiFetch, ensureAccessToken, login, signUp, logout, saveSocialCookies, deleteSocialAccount, getSocialAccounts } = useAuth();
-  const [inputUrl, setInputUrl] = useState('');
-  const [searchUrl, setSearchUrl] = useState('');
+  const [inputUrl, setInputUrl] = useState(initialRecord?.url ?? '');
+  const [searchUrl, setSearchUrl] = useState(initialRecord?.url ?? '');
   const [selectedFormat, setSelectedFormat] = useState<VideoFormat | null>(null);
-  const [mode, setMode] = useState<AppMode>('default');
+  const [mode, setMode] = useState<AppMode>(initialRecord?.mode ?? 'default');
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [isSignup, setIsSignup] = useState(false);
   const [accountEmail, setAccountEmail] = useState('');
@@ -83,14 +111,80 @@ export default function HomeScreen() {
   const [cookieText, setCookieText] = useState('');
   const [socialAccounts, setSocialAccounts] = useState<SocialAccount[]>([]);
 
-  const [isBoostMode, setIsBoostMode] = useState(true);
+  const [isBoostMode, setIsBoostMode] = useState(initialRecord?.serverBoost !== 0);
   const [isDownloading, setIsDownloading] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [downloadSpeed, setDownloadSpeed] = useState(0);
+  const pausedDownloadIds = useRef(new Set<number>());
+  const unregisterDownloadControls = useRef(new Map<number, () => void>());
 
   const activeMode = MODES.find((item) => item.id === mode) ?? MODES[0];
   const { data: videoInfo, isLoading, error, refetch } = useFastApiMetadata(searchUrl, mode);
   const logDownloadMutation = useLogDownload();
+  const updateDownloadMutation = useUpdateDownload();
+  const { data: activeDownloadCount = 0 } = useActiveDownloadCount();
+
+  const trackNativeDownload = (
+    recordId: number,
+    downloadTask: ReturnType<typeof FileSystem.createDownloadResumable>,
+    destination: string,
+  ) => {
+    const unregisterPrevious = unregisterDownloadControls.current.get(recordId);
+    unregisterPrevious?.();
+    const controls = {
+      pause: async () => {
+        const snapshot = await downloadTask.pauseAsync();
+        const safeSnapshot = {
+          ...snapshot,
+          options: {
+            ...snapshot.options,
+            headers: Object.fromEntries(
+              Object.entries(snapshot.options.headers ?? {}).filter(
+                ([name]) => name.toLowerCase() !== 'authorization',
+              ),
+            ),
+          },
+        };
+        pausedDownloadIds.current.add(recordId);
+        await updateDownloadMutation.mutateAsync({
+          id: recordId,
+          update: {
+            status: 'paused',
+            resumeSnapshot: JSON.stringify(safeSnapshot),
+          },
+        });
+      },
+      cancel: async () => {
+        await downloadTask.cancelAsync();
+        await FileSystem.deleteAsync(destination, { idempotent: true });
+        await updateDownloadMutation.mutateAsync({
+          id: recordId,
+          update: { status: 'cancelled', resumeSnapshot: null, cancelToken: null },
+        });
+      },
+    };
+    unregisterDownloadControls.current.set(
+      recordId,
+      registerDownloadControls(recordId, controls),
+    );
+  };
+  const untrackNativeDownload = (recordId: number) => {
+    unregisterDownloadControls.current.get(recordId)?.();
+    unregisterDownloadControls.current.delete(recordId);
+  };
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (state) => {
+      if (state !== 'active') {
+        for (const activeDownloadId of unregisterDownloadControls.current.keys()) {
+          void pauseActiveDownload(activeDownloadId).catch((pauseError: unknown) => {
+            console.error('[MeloStream automatic download pause failed]', pauseError);
+          });
+        }
+      }
+    });
+    return () => subscription.remove();
+  }, []);
 
   useEffect(() => {
     if (!email) return;
@@ -127,14 +221,14 @@ export default function HomeScreen() {
     }
   };
 
-  const saveToGallery = async (fileUri: string): Promise<string> => {
-    if (Platform.OS === 'web') return fileUri;
+  const saveToGallery = async (fileUri: string): Promise<{ uri: string; assetId: string | null }> => {
+    if (Platform.OS === 'web') return { uri: fileUri, assetId: null };
     const album = await MediaLibrary.Album.get('MeloStream');
     const asset = await MediaLibrary.Asset.create(fileUri, album ?? undefined);
     if (!album) await MediaLibrary.Album.create('MeloStream', [asset]);
     const galleryUri = await asset.getUri();
     await FileSystem.deleteAsync(fileUri);
-    return galleryUri;
+    return { uri: galleryUri, assetId: asset.id };
   };
 
   const handleDownload = async () => {
@@ -143,10 +237,14 @@ export default function HomeScreen() {
       return;
     }
 
+    let downloadRecordId: number | null = null;
+    let temporaryDownloadPath: string | null = null;
+    let lastHistoryProgressUpdate = 0;
     try {
       setIsDownloading(true);
       setDownloadProgress(0);
       setDownloadSpeed(0);
+      pausedDownloadIds.current.clear();
       await requestGalleryPermission();
       const downloadStartTime = Date.now();
       const appStorageDirectory = FileSystem.documentDirectory ?? FileSystem.cacheDirectory ?? '';
@@ -157,9 +255,41 @@ export default function HomeScreen() {
       }
 
       const isSocialPlatform = isSocialVideoUrl(videoInfo.sourceUrl);
+      const historyRecordId = await logDownloadMutation.mutateAsync({
+        title: videoInfo.title,
+        url: videoInfo.sourceUrl,
+        localPath: '',
+        fileSize: selectedFormat.fileSizeEstimate ?? 0,
+        resolution: selectedFormat.resolution,
+        thumbnail: videoInfo.thumbnail,
+        mediaAssetId: null,
+        cancelToken: null,
+        resumeSnapshot: null,
+        mode,
+        formatId: selectedFormat.formatId,
+        serverBoost: isBoostMode ? 1 : 0,
+        status: isBoostMode ? 'queued' : 'downloading',
+        progress: 0,
+        taskId: null,
+        error: null,
+      });
+      downloadRecordId = historyRecordId;
+      router.push('/history');
       let finalLocalUri = '';
+      const updateHistoryProgress = (progress: number) => {
+        setDownloadProgress(progress);
+        const now = Date.now();
+        if (now - lastHistoryProgressUpdate < 1000 && progress < 100) return;
+        lastHistoryProgressUpdate = now;
+        void updateDownloadMutation.mutateAsync({
+          id: historyRecordId,
+          update: { progress: Math.min(progress, 100) },
+        }).catch((updateError: unknown) => {
+          console.error('[MeloStream download history update failed]', updateError);
+        });
+      };
 
-      if (isBoostMode) {
+      if (isBoostMode || isSocialPlatform) {
         const serverResponse = await apiFetch('/download', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -174,20 +304,35 @@ export default function HomeScreen() {
           throw new Error(await responseError(serverResponse, 'Server-side download could not be started.'));
         }
 
-        const { taskId } = await serverResponse.json() as DownloadQueuedResponse;
+        const { taskId, cancellationToken } = await serverResponse.json() as DownloadQueuedResponse;
         if (!taskId) throw new Error('The server did not return a download task ID.');
+        await updateDownloadMutation.mutateAsync({
+          id: downloadRecordId,
+          update: { taskId, cancelToken: cancellationToken, status: 'queued' },
+        });
         let fileName: string | undefined;
 
         while (!fileName) {
+          if (isDownloadCancelled(historyRecordId)) {
+            throw new Error('Download cancelled.');
+          }
           await new Promise<void>((resolve) => setTimeout(resolve, 1000));
           const statusResponse = await apiFetch(`/download/${encodeURIComponent(taskId)}`);
           if (!statusResponse.ok) {
             throw new Error(await responseError(statusResponse, 'Could not read server download status.'));
           }
           const taskStatus = await statusResponse.json() as DownloadStatusResponse;
+          if (taskStatus.status === 'cancelled') {
+            throw new Error('Download cancelled.');
+          }
           if (taskStatus.status === 'failure') {
             throw new Error(taskStatus.error || 'Server-side video processing failed.');
           }
+          const status = taskStatus.status === 'queued' ? 'queued' : 'processing';
+          await updateDownloadMutation.mutateAsync({
+            id: downloadRecordId,
+            update: { status },
+          });
           if (taskStatus.status === 'success') {
             if (!taskStatus.fileName) throw new Error('Server reported success without a video file.');
             fileName = taskStatus.fileName;
@@ -196,10 +341,15 @@ export default function HomeScreen() {
 
         const targetStreamUrl = `${BACKEND_BASE_URL}/stream/${encodeURIComponent(fileName)}`;
         const targetLocalPath = `${localDirectory}${fileName}`;
+        temporaryDownloadPath = targetLocalPath;
         const streamToken = isSocialPlatform ? await ensureAccessToken() : null;
         if (isSocialPlatform && !streamToken) {
           throw new Error('Please log in to download this video');
         }
+        await updateDownloadMutation.mutateAsync({
+          id: downloadRecordId,
+          update: { status: 'downloading', progress: 0 },
+        });
         const downloadTask = FileSystem.createDownloadResumable(
           targetStreamUrl,
           targetLocalPath,
@@ -214,43 +364,42 @@ export default function HomeScreen() {
             const expected = progress.totalBytesExpectedToWrite;
             const percent = expected > 0 ? (written / expected) * 100 : 0;
             const elapsed = (Date.now() - downloadStartTime) / 1000;
-            setDownloadProgress(Math.min(percent, 100));
+            updateHistoryProgress(percent);
             setDownloadSpeed(elapsed > 0 ? (written / (1024 * 1024)) / elapsed : 0);
           },
         );
+        trackNativeDownload(historyRecordId, downloadTask, targetLocalPath);
         const result = await downloadTask.downloadAsync();
+        untrackNativeDownload(historyRecordId);
+        if (pausedDownloadIds.current.has(historyRecordId)) return;
         if (!result?.uri) throw new Error('File delivery network stream aborted.');
         finalLocalUri = result.uri;
-      } else if (isSocialPlatform) {
-        const directToken = await ensureAccessToken();
-        if (!directToken) throw new Error('Please log in to download this video');
-        const directUrl = `${BACKEND_BASE_URL}/download/direct?url=${encodeURIComponent(videoInfo.sourceUrl)}&format_id=${encodeURIComponent(selectedFormat.formatId)}&mode=${mode}`;
+      } else {
+        await updateDownloadMutation.mutateAsync({
+          id: downloadRecordId,
+          update: { status: 'downloading', progress: 0 },
+        });
+        const targetLocalPath =
+          `${localDirectory}melo_${Date.now()}.${selectedFormat.extension}`;
+        temporaryDownloadPath = targetLocalPath;
         const downloadTask = FileSystem.createDownloadResumable(
-          directUrl,
-          `${localDirectory}melo_${Date.now()}.mp4`,
-          { headers: { Authorization: `Bearer ${directToken}` } },
+          selectedFormat.url,
+          targetLocalPath,
+          {},
           (progress) => {
             const written = progress.totalBytesWritten;
             const expected = progress.totalBytesExpectedToWrite;
             const elapsed = (Date.now() - downloadStartTime) / 1000;
-            setDownloadProgress(expected > 0 ? Math.min((written / expected) * 100, 100) : 0);
+            updateHistoryProgress(expected > 0 ? (written / expected) * 100 : 0);
             setDownloadSpeed(elapsed > 0 ? (written / (1024 * 1024)) / elapsed : 0);
           },
         );
+        trackNativeDownload(historyRecordId, downloadTask, targetLocalPath);
         const result = await downloadTask.downloadAsync();
-        if (!result?.uri) throw new Error('Authenticated video stream aborted.');
+        untrackNativeDownload(historyRecordId);
+        if (pausedDownloadIds.current.has(historyRecordId)) return;
+        if (!result?.uri) throw new Error('Local file download stream aborted.');
         finalLocalUri = result.uri;
-      } else {
-        const resultUri = await executeSingleThreadDownload({
-          videoUrl: selectedFormat.url,
-          fileName: `melo_${Date.now()}.${selectedFormat.extension}`,
-          onProgress: (progress) => {
-            setDownloadProgress(progress.progressPercent);
-            setDownloadSpeed(progress.downloadSpeedMBs);
-          },
-        });
-        if (!resultUri) throw new Error('Local background file storage stream aborted.');
-        finalLocalUri = resultUri;
       }
 
       const localFileInfo = await FileSystem.getInfoAsync(finalLocalUri);
@@ -258,23 +407,59 @@ export default function HomeScreen() {
         localFileInfo.exists && typeof localFileInfo.size === 'number'
           ? localFileInfo.size
           : selectedFormat.fileSizeEstimate ?? 0;
-      finalLocalUri = await saveToGallery(finalLocalUri);
-      await logDownloadMutation.mutateAsync({
-        title: videoInfo.title,
-        url: videoInfo.sourceUrl,
-        localPath: finalLocalUri,
-        fileSize: downloadedFileSize,
-        resolution: selectedFormat.resolution,
-        thumbnail: videoInfo.thumbnail,
+      const savedAsset = await saveToGallery(finalLocalUri);
+      await updateDownloadMutation.mutateAsync({
+        id: downloadRecordId,
+        update: {
+          localPath: savedAsset.uri,
+          mediaAssetId: savedAsset.assetId,
+          fileSize: downloadedFileSize,
+          status: 'completed',
+          progress: 100,
+          resumeSnapshot: null,
+          cancelToken: null,
+          error: null,
+        },
       });
-      Alert.alert('Download Complete', 'Video saved to your device and MeloStream library!');
+      untrackNativeDownload(historyRecordId);
+      clearDownloadCancellation(historyRecordId);
+      temporaryDownloadPath = null;
     } catch (err: unknown) {
       console.error('[MeloStream Download Runtime Interrupted]:', err);
-      Alert.alert(
-        'Download Interrupted',
-        err instanceof Error ? err.message : 'An unexpected file system error occurred.',
-      );
+      const wasPaused =
+        downloadRecordId !== null && pausedDownloadIds.current.has(downloadRecordId);
+      const wasCancelled =
+        downloadRecordId !== null && isDownloadCancelled(downloadRecordId);
+      if (!wasPaused && !wasCancelled && temporaryDownloadPath) {
+        try {
+          await FileSystem.deleteAsync(temporaryDownloadPath, { idempotent: true });
+        } catch (cleanupError: unknown) {
+          console.error('[MeloStream failed to remove partial download]', cleanupError);
+        }
+      }
+      if (downloadRecordId !== null && !wasPaused && !wasCancelled) {
+        try {
+          await updateDownloadMutation.mutateAsync({
+            id: downloadRecordId,
+            update: {
+              status: 'failed',
+              resumeSnapshot: null,
+              cancelToken: null,
+              error: err instanceof Error ? err.message : 'An unexpected download error occurred.',
+            },
+          });
+        } catch (historyError: unknown) {
+          console.error('[MeloStream failed to record download error]', historyError);
+        }
+      }
+      if (!wasPaused && !wasCancelled) {
+        Alert.alert(
+          'Download Interrupted',
+          err instanceof Error ? err.message : 'An unexpected file system error occurred.',
+        );
+      }
     } finally {
+      if (downloadRecordId !== null) untrackNativeDownload(downloadRecordId);
       setIsDownloading(false);
     }
   };
@@ -334,7 +519,14 @@ export default function HomeScreen() {
             className="px-3 py-2 rounded-full"
             style={{ backgroundColor: activeMode.surface, borderColor: activeMode.border, borderWidth: 1 }}
           >
-            <Text style={{ color: activeMode.accent }} className="text-xs font-bold">History</Text>
+            <View className="flex-row items-center gap-2">
+              <Text style={{ color: activeMode.accent }} className="text-xs font-bold">History</Text>
+              {activeDownloadCount > 0 && (
+                <View className="min-w-5 h-5 px-1 rounded-full bg-red-600 items-center justify-center">
+                  <Text className="text-white text-[10px] font-black">{activeDownloadCount}</Text>
+                </View>
+              )}
+            </View>
           </TouchableOpacity>
           <TouchableOpacity
             accessibilityLabel="Open sidebar settings"
@@ -347,7 +539,7 @@ export default function HomeScreen() {
         </View>
       </View>
 
-      <ScrollView showsVerticalScrollIndicator={false} className="flex-1">
+      <ScrollView showsVerticalScrollIndicator={false} className="flex-1" contentContainerStyle={{ paddingBottom: 20 }}>
         <View className="p-4 rounded-3xl mb-6" style={{ backgroundColor: activeMode.surface, borderColor: activeMode.border, borderWidth: 1 }}>
           <Text className="text-slate-300 text-sm font-medium mb-2">Paste Video Destination Link</Text>
           <TextInput
@@ -442,19 +634,36 @@ export default function HomeScreen() {
                 );
               }) : <Text className="text-slate-500 text-xs">No explicit stream formats available.</Text>}
             </View>
-            <TouchableOpacity
-              onPress={handleDownload}
-              disabled={!selectedFormat || isDownloading}
-              className="disabled:opacity-50 py-3 rounded-xl items-center"
-              style={{ backgroundColor: activeMode.accent }}
-            >
-              <Text className="text-slate-950 font-bold text-sm">
-                {isBoostMode ? '🚀 Start Server Boost Download' : '📱 Start Phone Direct Download'}
-              </Text>
-            </TouchableOpacity>
           </View>
         )}
       </ScrollView>
+
+      {videoInfo && (
+        <View
+          className="border-t px-4 pt-3 pb-2"
+          style={{
+            backgroundColor: activeMode.background,
+            borderColor: activeMode.border,
+            zIndex: 100,
+            elevation: 100,
+          }}
+        >
+          <TouchableOpacity
+            onPress={handleDownload}
+            disabled={!selectedFormat || isDownloading}
+            className="disabled:opacity-50 py-3.5 rounded-2xl items-center"
+            style={{ backgroundColor: activeMode.accent }}
+          >
+            <Text className="text-slate-950 font-bold text-sm">
+              {isDownloading
+                ? 'Download in progress…'
+                : isBoostMode
+                  ? '🚀 Start Server Boost Download'
+                  : '📱 Start Phone Direct Download'}
+            </Text>
+          </TouchableOpacity>
+        </View>
+      )}
 
       <Modal
         visible={settingsOpen}
@@ -476,6 +685,16 @@ export default function HomeScreen() {
 
             <ScrollView showsVerticalScrollIndicator={false}>
               <Text className="text-slate-300 font-bold text-xs mb-2">APP MODE</Text>
+              <TouchableOpacity
+                onPress={() => {
+                  setSettingsOpen(false);
+                  router.push('/social-guide');
+                }}
+                className="bg-indigo-950/50 border border-indigo-800 rounded-xl p-3 mb-4"
+              >
+                <Text className="text-indigo-300 font-bold text-xs">Social account setup guide →</Text>
+                <Text className="text-slate-400 text-[10px] mt-1">How to connect YouTube, TikTok, and Telegram</Text>
+              </TouchableOpacity>
               <View className="gap-2 mb-5">
                 {MODES.map((item) => (
                   <TouchableOpacity

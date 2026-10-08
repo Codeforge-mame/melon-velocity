@@ -1,15 +1,15 @@
 import asyncio
-import glob
 import logging
 import os
 import re
-import shutil
-import tempfile
+import time
 import uuid
 
-import yt_dlp
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
+from jose import JWTError, jwt
+from redis import Redis
+from redis.exceptions import RedisError
 from starlette.concurrency import run_in_threadpool
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -17,10 +17,11 @@ from sqlalchemy.orm import Session
 from app.api.auth import get_current_user, get_optional_user
 from app.core.celery_app import celery_app
 from app.core.config import settings
-from app.db import SessionLocal, get_db
+from app.db import get_db
 from app.models import User, UserSocialAccount
 from app.schemas.video import (
     AppMode,
+    DownloadCancelRequest,
     DownloadQueuedResponse,
     DownloadStatusResponse,
     VideoDownloadRequest,
@@ -32,11 +33,28 @@ from app.services.social_sessions import (
     SocialAccountMissingError,
     temporary_cookie_file,
 )
-from app.services.tasks import download_video_task
+from app.services.tasks import CANCELLED_DOWNLOAD_KEY_PREFIX, download_video_task
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 FORMAT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
+CANCEL_TOKEN_LIFETIME_SECONDS = 6 * 60 * 60
+STREAM_FILE_TTL_SECONDS = 6 * 60 * 60
+
+
+def create_cancellation_token(task_id: str, user: User | None) -> str:
+    if not settings.JWT_SECRET_KEY:
+        raise HTTPException(status_code=503, detail="Download cancellation is unavailable.")
+    return jwt.encode(
+        {
+            "task_id": task_id,
+            "sub": str(user.id) if user else "anonymous",
+            "purpose": "cancel-download",
+            "exp": int(time.time()) + CANCEL_TOKEN_LIFETIME_SECONDS,
+        },
+        settings.JWT_SECRET_KEY.get_secret_value(),
+        algorithm="HS256",
+    )
 
 
 def validate_platform_mode(target_url: str, mode: AppMode, user: User | None):
@@ -98,6 +116,8 @@ async def download_video(
     user: User | None = Depends(get_optional_user),
     db: Session = Depends(get_db),
 ):
+    if not settings.JWT_SECRET_KEY:
+        raise HTTPException(status_code=503, detail="Download cancellation is unavailable.")
     if not FORMAT_ID_PATTERN.fullmatch(payload.format_id):
         raise HTTPException(status_code=400, detail="The selected video format ID is invalid.")
     platform = validate_platform_mode(payload.url, payload.mode, user)
@@ -135,44 +155,89 @@ async def download_video(
         success=True,
         message="Video download queued.",
         taskId=task.id,
+        cancellationToken=create_cancellation_token(task.id, user if platform else None),
     )
 
 
-def _run_authenticated_direct_download(
-    target_url: str, format_id: str, user_id: uuid.UUID
-) -> tuple[str, str]:
-    temp_dir = tempfile.mkdtemp(prefix="melostream-direct-", dir=settings.TEMP_DIR)
+@router.post("/download/{task_id}/cancel")
+async def cancel_download(
+    task_id: str,
+    payload: DownloadCancelRequest,
+    user: User | None = Depends(get_optional_user),
+):
     try:
-        platform = VideoExtractorService.platform_for_url(target_url)
-        if platform is None:
-            raise ValueError("The authenticated direct download is only for supported platforms.")
+        uuid.UUID(task_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Download task not found.") from exc
 
-        with SessionLocal() as db:
-            with temporary_cookie_file(db, user_id, platform) as cookie_file:
-                options = VideoExtractorService.build_ydl_options(cookie_file)
-                options.update(
-                    {
-                        "format": f"{format_id}+bestaudio/best",
-                        "outtmpl": os.path.join(temp_dir, "video.%(ext)s"),
-                        "merge_output_format": "mp4",
-                        "postprocessors": [
-                            {"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}
-                        ],
-                    }
-                )
-                with yt_dlp.YoutubeDL(options) as downloader:
-                    info = downloader.extract_info(target_url, download=True)
+    if not settings.JWT_SECRET_KEY:
+        raise HTTPException(status_code=503, detail="Download cancellation is unavailable.")
+    try:
+        claims = jwt.decode(
+            payload.cancellationToken,
+            settings.JWT_SECRET_KEY.get_secret_value(),
+            algorithms=["HS256"],
+        )
+    except JWTError as exc:
+        raise HTTPException(status_code=404, detail="Download task not found.") from exc
 
-        candidate = info.get("filepath") if info else None
-        if candidate and os.path.isfile(candidate):
-            return temp_dir, candidate
-        outputs = glob.glob(os.path.join(temp_dir, "video.*"))
-        if len(outputs) == 1:
-            return temp_dir, outputs[0]
-        raise FileNotFoundError("yt-dlp completed without producing a video file.")
-    except Exception:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        raise
+    token_user_id = claims.get("sub")
+    if (
+        claims.get("purpose") != "cancel-download"
+        or claims.get("task_id") != task_id
+        or (
+            token_user_id != "anonymous"
+            and (user is None or token_user_id != str(user.id))
+        )
+    ):
+        raise HTTPException(status_code=404, detail="Download task not found.")
+
+    task = celery_app.AsyncResult(task_id)
+    if task.state in {"SUCCESS", "FAILURE", "REVOKED"}:
+        if (
+            task.state == "SUCCESS"
+            and isinstance(task.result, dict)
+            and task.result.get("status") == "cancelled"
+        ):
+            return {"taskId": task_id, "status": "cancelled"}
+        if task.state == "SUCCESS" and isinstance(task.result, dict):
+            result_user_id = task.result.get("userId")
+            if result_user_id and token_user_id != str(result_user_id):
+                raise HTTPException(status_code=404, detail="Download task not found.")
+            file_name = task.result.get("fileName")
+            if (
+                isinstance(file_name, str)
+                and os.path.basename(file_name) == file_name
+                and file_name.startswith("melo_")
+            ):
+                output_path = os.path.join(settings.DOWNLOAD_DIR, file_name)
+                try:
+                    os.remove(output_path)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    logger.exception("Failed to remove cancelled output %s.", output_path)
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Could not remove the cancelled server download.",
+                    ) from exc
+            return {"taskId": task_id, "status": "cancelled"}
+        raise HTTPException(status_code=409, detail="This download can no longer be cancelled.")
+
+    redis_client = Redis.from_url(settings.REDIS_URL)
+    try:
+        await run_in_threadpool(
+            redis_client.setex,
+            f"{CANCELLED_DOWNLOAD_KEY_PREFIX}{task_id}",
+            CANCEL_TOKEN_LIFETIME_SECONDS,
+            "1",
+        )
+    except RedisError as exc:
+        logger.exception("Failed to signal cancellation for task %s.", task_id)
+        raise HTTPException(status_code=503, detail="The download service is unavailable.") from exc
+    finally:
+        await run_in_threadpool(redis_client.close)
+    return {"taskId": task_id, "status": "cancelling"}
 
 
 @router.get("/download/direct")
@@ -187,17 +252,40 @@ async def direct_download(
         raise HTTPException(status_code=400, detail="The selected video format ID is invalid.")
     if validate_platform_mode(url, mode, user) is None:
         raise HTTPException(status_code=400, detail="This endpoint only supports YouTube, TikTok, and Telegram.")
+
+    file_id = f"{user.id}_{uuid.uuid4()}"
     try:
-        temp_dir, output_path = await run_in_threadpool(
-            _run_authenticated_direct_download, url, format_id, user.id
+        task = await run_in_threadpool(
+            download_video_task.apply_async,
+            args=[url, format_id, file_id, str(user.id)],
         )
-    except SocialAccountMissingError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
-        logger.exception("Authenticated direct download failed.")
+        logger.exception("Failed to enqueue authenticated direct download.")
+        raise HTTPException(
+            status_code=503,
+            detail="The download queue is unavailable. Please try again shortly.",
+        ) from exc
+
+    try:
+        result = await run_in_threadpool(task.get)
+    except Exception as exc:
+        logger.exception("Authenticated direct download task failed.")
         raise HTTPException(status_code=500, detail="Could not download this video.") from exc
 
-    background_tasks.add_task(shutil.rmtree, temp_dir, True)
+    if (
+        not isinstance(result, dict)
+        or result.get("userId") != str(user.id)
+        or not isinstance(result.get("fileName"), str)
+        or os.path.basename(result["fileName"]) != result["fileName"]
+        or not result["fileName"].startswith(f"melo_{file_id}.")
+    ):
+        raise HTTPException(status_code=500, detail="The download worker returned an invalid result.")
+
+    output_path = os.path.join(settings.DOWNLOAD_DIR, result["fileName"])
+    if not os.path.isfile(output_path):
+        raise HTTPException(status_code=500, detail="The download worker did not produce a video.")
+
+    background_tasks.add_task(delayed_cleanup, output_path, STREAM_FILE_TTL_SECONDS)
     return FileResponse(
         output_path,
         media_type="video/mp4",
@@ -224,6 +312,8 @@ async def get_download_status(
         task_user_id = task.result.get("userId")
         if task_user_id and (user is None or task_user_id != str(user.id)):
             raise HTTPException(status_code=404, detail="Download task not found.")
+        if task.result.get("status") == "cancelled":
+            return DownloadStatusResponse(taskId=task_id, status="cancelled")
         return DownloadStatusResponse(
             taskId=task_id,
             status="success",
@@ -241,6 +331,7 @@ async def get_download_status(
         "PENDING": "queued",
         "STARTED": "processing",
         "RETRY": "retrying",
+        "REVOKED": "cancelled",
     }.get(task.state, task.state.lower())
     return DownloadStatusResponse(taskId=task_id, status=status)
 
@@ -264,7 +355,7 @@ async def stream_file_to_mobile(
     if not os.path.isfile(file_path):
         raise HTTPException(status_code=404, detail="Requested file not found on storage cache.")
 
-    background_tasks.add_task(delayed_cleanup, file_path, 120)
+    background_tasks.add_task(delayed_cleanup, file_path, STREAM_FILE_TTL_SECONDS)
     return FileResponse(
         file_path,
         media_type="video/mp4",

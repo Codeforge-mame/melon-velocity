@@ -34,6 +34,10 @@ class DownloadQueuedResponse(BaseModel):
     success: bool
     message: str
     taskId: str
+    cancellationToken: str
+
+class DownloadCancelRequest(BaseModel):
+    cancellationToken: str
 
 class DownloadStatusResponse(BaseModel):
     taskId: str
