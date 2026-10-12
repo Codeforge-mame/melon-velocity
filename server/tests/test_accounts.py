@@ -13,11 +13,11 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 from pydantic import SecretStr
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 from redis.exceptions import RedisError
 
 from app.api.auth import get_redis, router as auth_router
-from app.api.routes import router as video_router
+from app.api.routes import create_cancellation_token, router as video_router
 from app.core.celery_app import celery_app
 from app.core.config import settings
 from app.core.middlware import RateLimitMiddleware
@@ -234,15 +234,15 @@ class AccountFeatureTests(unittest.TestCase):
         self.assertEqual(refreshed.status_code, 200)
         self.assertNotEqual(self.client.cookies.get("refresh_token"), first_refresh_token)
 
-    def test_supported_urls_require_matching_logged_in_platform_mode(self) -> None:
-        unauthenticated = self.client.post(
+    def test_burner_metadata_requires_configuration_and_matching_mode(self) -> None:
+        unconfigured = self.client.post(
             "/api/v1/info",
             json={"url": "https://www.youtube.com/watch?v=sample", "mode": "youtube"},
         )
-        self.assertEqual(unauthenticated.status_code, 401)
+        self.assertEqual(unconfigured.status_code, 503)
         self.assertEqual(
-            unauthenticated.json()["detail"],
-            "Please log in to download this video",
+            unconfigured.json()["detail"],
+            "The YouTube burner cookies are not configured.",
         )
         download = self.client.post(
             "/api/v1/download",
@@ -253,10 +253,10 @@ class AccountFeatureTests(unittest.TestCase):
                 "mode": "default",
             },
         )
-        self.assertEqual(download.status_code, 401)
+        self.assertEqual(download.status_code, 400)
         self.assertEqual(
             download.json()["detail"],
-            "Please log in to download this video",
+            "Switch to YouTube mode to download this URL.",
         )
 
         email, password = self.create_user()
@@ -271,10 +271,10 @@ class AccountFeatureTests(unittest.TestCase):
             json={"url": "https://www.youtube.com/watch?v=sample", "mode": "default"},
             headers=headers,
         )
-        self.assertEqual(default_mode.status_code, 401)
+        self.assertEqual(default_mode.status_code, 400)
         self.assertEqual(
             default_mode.json()["detail"],
-            "Please log in to download this video",
+            "Switch to YouTube mode to download this URL.",
         )
         default_download = self.client.post(
             "/api/v1/download",
@@ -286,28 +286,48 @@ class AccountFeatureTests(unittest.TestCase):
             },
             headers=headers,
         )
-        self.assertEqual(default_download.status_code, 401)
+        self.assertEqual(default_download.status_code, 400)
         self.assertEqual(
             default_download.json()["detail"],
-            "Please log in to download this video",
+            "Switch to YouTube mode to download this URL.",
         )
 
-    def test_queued_download_cancellation_requires_its_signed_token(self) -> None:
-        task_id = str(uuid.uuid4())
-        queued_task = Mock(id=task_id)
-        payload = {
-            "url": "https://www.facebook.com/watch/sample",
-            "format_id": "18",
-            "resolution": "360p",
-            "mode": "default",
-        }
-        with patch(
-            "app.api.routes.download_video_task.apply_async",
-            return_value=queued_task,
+    def test_anonymous_youtube_metadata_uses_and_removes_burner_cookie_file(self) -> None:
+        cookie_text = "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tsecret\n"
+
+        async def fake_metadata(url: str, cookie_file: str | None = None) -> dict:
+            self.assertTrue(cookie_file and os.path.isfile(cookie_file))
+            with open(cookie_file, encoding="utf-8") as cookies:
+                self.assertEqual(cookies.read(), cookie_text)
+            return {
+                "title": "Sample video",
+                "thumbnail": "",
+                "duration": 1,
+                "uploader": "Sample uploader",
+                "sourceUrl": url,
+                "formats": [],
+            }
+
+        with (
+            patch.object(settings, "BURNER_YOUTUBE_COOKIES", cookie_text),
+            patch(
+                "app.api.routes.VideoExtractorService.extract_metadata",
+                new=AsyncMock(side_effect=fake_metadata),
+            ) as extract_metadata,
         ):
-            queued = self.client.post("/api/v1/download", json=payload)
-        self.assertEqual(queued.status_code, 202)
-        token = queued.json()["cancellationToken"]
+            response = self.client.post(
+                "/api/v1/info",
+                json={"url": "https://www.youtube.com/watch?v=sample", "mode": "youtube"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["title"], "Sample video")
+        cookie_file = extract_metadata.await_args.args[1]
+        self.assertFalse(os.path.exists(cookie_file))
+
+    def test_existing_download_cancellation_requires_a_signed_token(self) -> None:
+        task_id = str(uuid.uuid4())
+        token = create_cancellation_token(task_id, None)
 
         with (
             patch("app.api.routes.Redis.from_url", return_value=self.redis),
@@ -444,60 +464,70 @@ class AccountFeatureTests(unittest.TestCase):
             finally:
                 settings.DOWNLOAD_DIR = previous_download_dir
 
-    def test_authenticated_direct_download_uses_the_bounded_worker_queue(self) -> None:
-        email, password = self.create_user()
-        login = self.client.post(
-            "/api/v1/auth/token",
-            data={"username": email, "password": password},
-        )
-        user_id = login.json()["user"]["id"]
-        access_token = login.json()["access_token"]
+    def test_direct_download_streams_burner_cookie_sandbox_and_cleans_it(self) -> None:
         download_id = uuid.uuid4()
-        file_id = f"{user_id}_{download_id}"
-        file_name = f"melo_{file_id}.mp4"
-        fake_task = Mock()
-        fake_task.get.return_value = {"userId": user_id, "fileName": file_name}
+        cookie_text = "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tsecret\n"
+        with tempfile.TemporaryDirectory() as temp_root:
+            sandbox = os.path.join(temp_root, f"ytdl_{download_id}")
 
-        with tempfile.TemporaryDirectory() as download_dir:
-            previous_download_dir = settings.DOWNLOAD_DIR
-            settings.DOWNLOAD_DIR = download_dir
-            try:
-                with open(os.path.join(download_dir, file_name), "wb") as video_file:
-                    video_file.write(b"authenticated video bytes")
+            def fake_download(_url: str, options: dict) -> None:
+                self.assertEqual(options["cookiefile"], os.path.join(sandbox, "cookies.txt"))
+                self.assertEqual(options["http_chunk_size"], 5 * 1024 * 1024)
+                self.assertEqual(options["paths"]["temp"], sandbox)
+                with open(options["cookiefile"], encoding="utf-8") as cookie_file:
+                    self.assertEqual(cookie_file.read(), cookie_text)
+                output_path = options["outtmpl"].replace("%(ext)s", "mp4")
+                with open(output_path, "wb") as video_file:
+                    video_file.write(b"burner video bytes")
 
-                async def immediate_cleanup(path: str, _delay_seconds: int = 120) -> None:
-                    os.remove(path)
-
-                with (
-                    patch(
-                        "app.api.routes.download_video_task.apply_async",
-                        return_value=fake_task,
-                    ) as enqueue_task,
-                    patch("app.api.routes.delayed_cleanup", immediate_cleanup),
-                    patch("app.api.routes.uuid.uuid4", return_value=download_id),
-                ):
-                    response = self.client.get(
-                        "/api/v1/download/direct",
-                        params={
-                            "url": "https://www.youtube.com/watch?v=sample",
-                            "format_id": "18",
-                            "mode": "youtube",
-                        },
-                        headers={"Authorization": f"Bearer {access_token}"},
-                    )
-
-                self.assertEqual(response.status_code, 200)
-                self.assertEqual(response.content, b"authenticated video bytes")
-                enqueue_task.assert_called_once_with(
-                    args=[
-                        "https://www.youtube.com/watch?v=sample",
-                        "18",
-                        file_id,
-                        user_id,
-                    ]
+            with (
+                patch.object(settings, "BURNER_YOUTUBE_COOKIES", cookie_text),
+                patch("app.api.routes.tempfile.gettempdir", return_value=temp_root),
+                patch("app.api.routes.uuid.uuid4", return_value=download_id),
+                patch("app.api.routes._run_ytdlp_download", side_effect=fake_download),
+            ):
+                response = self.client.get(
+                    "/api/v1/download/direct",
+                    params={
+                        "url": "https://www.youtube.com/watch?v=sample",
+                        "format_id": "18",
+                        "mode": "youtube",
+                    },
                 )
-            finally:
-                settings.DOWNLOAD_DIR = previous_download_dir
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.content, b"burner video bytes")
+            self.assertEqual(response.headers["content-length"], str(len(b"burner video bytes")))
+            self.assertFalse(os.path.exists(sandbox))
+
+    def test_direct_download_uses_default_mode_without_cookies_for_external_sites(self) -> None:
+        download_id = uuid.uuid4()
+        with tempfile.TemporaryDirectory() as temp_root:
+            sandbox = os.path.join(temp_root, f"ytdl_{download_id}")
+
+            def fake_download(_url: str, options: dict) -> None:
+                self.assertNotIn("cookiefile", options)
+                with open(options["outtmpl"].replace("%(ext)s", "mp4"), "wb") as video_file:
+                    video_file.write(b"external video bytes")
+
+            with (
+                patch("app.api.routes.tempfile.gettempdir", return_value=temp_root),
+                patch("app.api.routes.uuid.uuid4", return_value=download_id),
+                patch("app.api.routes._run_ytdlp_download", side_effect=fake_download),
+            ):
+                response = self.client.post(
+                    "/api/v1/download",
+                    json={
+                        "url": "https://www.facebook.com/watch/sample",
+                        "format_id": "18",
+                        "resolution": "360p",
+                        "mode": "default",
+                    },
+                )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.content, b"external video bytes")
+            self.assertFalse(os.path.exists(sandbox))
 
 
 if __name__ == "__main__":

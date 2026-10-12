@@ -1,20 +1,24 @@
+import glob
 import asyncio
 import logging
 import os
 import re
+import shutil
+import tempfile
 import time
 import uuid
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from jose import JWTError, jwt
 from redis import Redis
 from redis.exceptions import RedisError
 from starlette.concurrency import run_in_threadpool
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+import yt_dlp
 
-from app.api.auth import get_current_user, get_optional_user
+from app.api.auth import get_optional_user
 from app.core.celery_app import celery_app
 from app.core.config import settings
 from app.db import get_db
@@ -22,7 +26,6 @@ from app.models import User, UserSocialAccount
 from app.schemas.video import (
     AppMode,
     DownloadCancelRequest,
-    DownloadQueuedResponse,
     DownloadStatusResponse,
     VideoDownloadRequest,
     VideoInfoRequest,
@@ -33,13 +36,25 @@ from app.services.social_sessions import (
     SocialAccountMissingError,
     temporary_cookie_file,
 )
-from app.services.tasks import CANCELLED_DOWNLOAD_KEY_PREFIX, download_video_task
+from app.services.tasks import (
+    CANCELLED_DOWNLOAD_KEY_PREFIX,
+    build_download_options,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 FORMAT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 CANCEL_TOKEN_LIFETIME_SECONDS = 6 * 60 * 60
 STREAM_FILE_TTL_SECONDS = 6 * 60 * 60
+STREAM_CHUNK_SIZE = 5 * 1024 * 1024
+DIRECT_DOWNLOAD_LIMIT = asyncio.Semaphore(2)
+PLATFORM_DISPLAY_NAMES = {"youtube": "YouTube", "tiktok": "TikTok", "telegram": "Telegram"}
+
+
+def write_cookie_file(file_path: str, cookie_text: str) -> None:
+    descriptor = os.open(file_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as cookie_file:
+        cookie_file.write(cookie_text)
 
 
 def create_cancellation_token(task_id: str, user: User | None) -> str:
@@ -71,7 +86,7 @@ def validate_platform_mode(target_url: str, mode: AppMode, user: User | None):
     if mode != platform:
         raise HTTPException(
             status_code=400,
-            detail=f"Switch to {platform.title()} mode to download this URL.",
+                detail=f"Switch to {PLATFORM_DISPLAY_NAMES.get(platform, platform.title())} mode to download this URL.",
         )
     return platform
 
@@ -92,71 +107,163 @@ async def get_video_info(
     user: User | None = Depends(get_optional_user),
     db: Session = Depends(get_db),
 ):
-    platform = validate_platform_mode(payload.url, payload.mode, user)
-
     try:
+        platform = VideoExtractorService.platform_for_url(payload.url)
+        if platform in {"youtube", "tiktok"}:
+            if payload.mode != platform:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Switch to {PLATFORM_DISPLAY_NAMES[platform]} mode to download this URL.",
+                )
+            cookie_text = getattr(settings, f"BURNER_{platform.upper()}_COOKIES")
+            if not cookie_text:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"The {PLATFORM_DISPLAY_NAMES[platform]} burner cookies are not configured.",
+                )
+            with tempfile.TemporaryDirectory(prefix=f"ytdl_info_{uuid.uuid4()}_") as info_dir:
+                cookie_file = os.path.join(info_dir, "cookies.txt")
+                write_cookie_file(cookie_file, cookie_text)
+                return await VideoExtractorService.extract_metadata(payload.url, cookie_file)
+
+        platform = validate_platform_mode(payload.url, payload.mode, user)
         if platform and user:
             with temporary_cookie_file(db, user.id, platform) as cookie_file:
                 return await VideoExtractorService.extract_metadata(payload.url, cookie_file)
         return await VideoExtractorService.extract_metadata(payload.url)
     except SocialAccountMissingError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception("Failed to extract metadata for a video URL.")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.post(
-    "/download",
-    response_model=DownloadQueuedResponse,
-    status_code=202,
-)
+@router.post("/download")
 async def download_video(
     payload: VideoDownloadRequest,
     user: User | None = Depends(get_optional_user),
     db: Session = Depends(get_db),
 ):
-    if not settings.JWT_SECRET_KEY:
-        raise HTTPException(status_code=503, detail="Download cancellation is unavailable.")
-    if not FORMAT_ID_PATTERN.fullmatch(payload.format_id):
+    return await direct_download(
+        url=payload.url,
+        format_id=payload.format_id,
+        mode=payload.mode,
+        user=user,
+        db=db,
+    )
+
+
+@router.get("/download/direct")
+async def direct_download(
+    url: str = Query(min_length=8, max_length=4096),
+    format_id: str = Query(min_length=1, max_length=100),
+    mode: AppMode = Query(),
+    user: User | None = Depends(get_optional_user),
+    db: Session = Depends(get_db),
+):
+    if not FORMAT_ID_PATTERN.fullmatch(format_id):
         raise HTTPException(status_code=400, detail="The selected video format ID is invalid.")
-    platform = validate_platform_mode(payload.url, payload.mode, user)
-    if platform:
-        account = db.scalar(
-            select(UserSocialAccount).where(
-                UserSocialAccount.user_id == user.id,
-                UserSocialAccount.platform == platform,
-            )
-        )
-        if account is None:
+
+    platform = VideoExtractorService.platform_for_url(url)
+    if platform in {"youtube", "tiktok"}:
+        if mode != platform:
             raise HTTPException(
                 status_code=400,
-                detail=f"No {platform} session cookies are saved for this account.",
+                detail=f"Switch to {PLATFORM_DISPLAY_NAMES[platform]} mode to download this URL.",
             )
+        cookie_text = getattr(settings, f"BURNER_{platform.upper()}_COOKIES")
+        if not cookie_text:
+            raise HTTPException(
+                status_code=503,
+                detail=f"The {PLATFORM_DISPLAY_NAMES[platform]} burner cookies are not configured.",
+            )
+    elif platform == "telegram":
+        if validate_platform_mode(url, mode, user) != platform:
+            raise HTTPException(status_code=400, detail="Switch to Telegram mode to download this URL.")
+        cookie_text = None
+    else:
+        if mode != "default":
+            raise HTTPException(status_code=400, detail="External URLs must use Default mode.")
+        cookie_text = None
 
-    file_id = (
-        f"{user.id}_{uuid.uuid4()}"
-        if platform and user
-        else str(uuid.uuid4())
-    )
+    file_id = str(uuid.uuid4())
+    sandbox = os.path.join(tempfile.gettempdir(), f"ytdl_{file_id}")
+    await DIRECT_DOWNLOAD_LIMIT.acquire()
+    response_owns_cleanup = False
     try:
-        task = await run_in_threadpool(
-            download_video_task.apply_async,
-            args=[payload.url, payload.format_id, file_id, str(user.id) if platform and user else None],
+        os.makedirs(sandbox, mode=0o700)
+        cookie_file = None
+        if cookie_text:
+            cookie_file = os.path.join(sandbox, "cookies.txt")
+            write_cookie_file(cookie_file, cookie_text)
+
+        if cookie_file:
+            options = build_download_options(
+                format_id, file_id, sandbox, cookie_file, output_dir=sandbox
+            )
+            await _finish_ytdlp_download(url, options)
+        elif platform == "telegram" and user:
+            with temporary_cookie_file(db, user.id, platform) as user_cookie_file:
+                options = build_download_options(
+                    format_id, file_id, sandbox, user_cookie_file, output_dir=sandbox
+                )
+                await _finish_ytdlp_download(url, options)
+        else:
+            options = build_download_options(
+                format_id, file_id, sandbox, output_dir=sandbox
+            )
+            await _finish_ytdlp_download(url, options)
+
+        output_matches = glob.glob(os.path.join(sandbox, f"melo_{file_id}.mp4"))
+        if not output_matches or not os.path.isfile(output_matches[0]):
+            raise HTTPException(status_code=500, detail="The download did not produce an MP4 video.")
+        output_path = output_matches[0]
+        file_size = os.path.getsize(output_path)
+
+        async def stream_video():
+            try:
+                with open(output_path, "rb") as video_file:
+                    while chunk := await run_in_threadpool(video_file.read, STREAM_CHUNK_SIZE):
+                        yield chunk
+            finally:
+                await run_in_threadpool(shutil.rmtree, sandbox, True)
+                DIRECT_DOWNLOAD_LIMIT.release()
+
+        response_owns_cleanup = True
+        return StreamingResponse(
+            stream_video(),
+            media_type="video/mp4",
+            headers={
+                "Content-Length": str(file_size),
+                "Content-Disposition": f'attachment; filename="melo_{file_id}.mp4"',
+                "Cache-Control": "no-store",
+            },
         )
     except Exception as exc:
-        logger.exception("Failed to enqueue video download.")
-        raise HTTPException(
-            status_code=503,
-            detail="The download queue is unavailable. Please try again shortly.",
-        ) from exc
+        logger.exception("Direct video download failed.")
+        if isinstance(exc, HTTPException):
+            raise
+        raise HTTPException(status_code=500, detail="Could not download this video.") from exc
+    finally:
+        if not response_owns_cleanup:
+            await run_in_threadpool(shutil.rmtree, sandbox, True)
+            DIRECT_DOWNLOAD_LIMIT.release()
 
-    return DownloadQueuedResponse(
-        success=True,
-        message="Video download queued.",
-        taskId=task.id,
-        cancellationToken=create_cancellation_token(task.id, user if platform else None),
-    )
+
+def _run_ytdlp_download(url: str, options: dict) -> None:
+    with yt_dlp.YoutubeDL(options) as ydl:
+        ydl.extract_info(url, download=True)
+
+
+async def _finish_ytdlp_download(url: str, options: dict) -> None:
+    download = asyncio.create_task(run_in_threadpool(_run_ytdlp_download, url, options))
+    try:
+        await asyncio.shield(download)
+    except asyncio.CancelledError:
+        await asyncio.shield(download)
+        raise
 
 
 @router.post("/download/{task_id}/cancel")
@@ -238,59 +345,6 @@ async def cancel_download(
     finally:
         await run_in_threadpool(redis_client.close)
     return {"taskId": task_id, "status": "cancelling"}
-
-
-@router.get("/download/direct")
-async def direct_download(
-    background_tasks: BackgroundTasks,
-    url: str = Query(min_length=8, max_length=4096),
-    format_id: str = Query(min_length=1, max_length=100),
-    mode: AppMode = Query(),
-    user: User = Depends(get_current_user),
-):
-    if not FORMAT_ID_PATTERN.fullmatch(format_id):
-        raise HTTPException(status_code=400, detail="The selected video format ID is invalid.")
-    if validate_platform_mode(url, mode, user) is None:
-        raise HTTPException(status_code=400, detail="This endpoint only supports YouTube, TikTok, and Telegram.")
-
-    file_id = f"{user.id}_{uuid.uuid4()}"
-    try:
-        task = await run_in_threadpool(
-            download_video_task.apply_async,
-            args=[url, format_id, file_id, str(user.id)],
-        )
-    except Exception as exc:
-        logger.exception("Failed to enqueue authenticated direct download.")
-        raise HTTPException(
-            status_code=503,
-            detail="The download queue is unavailable. Please try again shortly.",
-        ) from exc
-
-    try:
-        result = await run_in_threadpool(task.get)
-    except Exception as exc:
-        logger.exception("Authenticated direct download task failed.")
-        raise HTTPException(status_code=500, detail="Could not download this video.") from exc
-
-    if (
-        not isinstance(result, dict)
-        or result.get("userId") != str(user.id)
-        or not isinstance(result.get("fileName"), str)
-        or os.path.basename(result["fileName"]) != result["fileName"]
-        or not result["fileName"].startswith(f"melo_{file_id}.")
-    ):
-        raise HTTPException(status_code=500, detail="The download worker returned an invalid result.")
-
-    output_path = os.path.join(settings.DOWNLOAD_DIR, result["fileName"])
-    if not os.path.isfile(output_path):
-        raise HTTPException(status_code=500, detail="The download worker did not produce a video.")
-
-    background_tasks.add_task(delayed_cleanup, output_path, STREAM_FILE_TTL_SECONDS)
-    return FileResponse(
-        output_path,
-        media_type="video/mp4",
-        filename=os.path.basename(output_path),
-    )
 
 
 @router.get("/download/{task_id}", response_model=DownloadStatusResponse)

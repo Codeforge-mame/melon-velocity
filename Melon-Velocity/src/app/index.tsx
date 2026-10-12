@@ -36,18 +36,6 @@ import { SocialAccount, SocialPlatform, useAuth } from '../context/AuthContext';
 
 type AppMode = VideoAppMode;
 
-interface DownloadQueuedResponse {
-  taskId: string;
-  cancellationToken: string;
-}
-
-interface DownloadStatusResponse {
-  status: 'queued' | 'processing' | 'retrying' | 'success' | 'failure' | 'cancelled';
-  fileName?: string;
-  fileSize?: number;
-  error?: string;
-}
-
 const MODES: { id: AppMode; title: string; subtitle: string; accent: string; background: string; surface: string; border: string }[] = [
   { id: 'default', title: 'Default', subtitle: 'Public links from any supported yt-dlp site', accent: '#818cf8', background: '#090d18', surface: '#111827', border: '#293449' },
   { id: 'youtube', title: 'YouTube', subtitle: 'YouTube session-based downloads', accent: '#fb4b4b', background: '#190b0d', surface: '#271214', border: '#512126' },
@@ -290,60 +278,17 @@ function HomeScreenContent({ initialRecord }: { initialRecord?: DownloadRecord }
       };
 
       if (isBoostMode || isSocialPlatform) {
-        const serverResponse = await apiFetch('/download', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            url: videoInfo.sourceUrl,
-            format_id: selectedFormat.formatId,
-            resolution: selectedFormat.resolution,
-            mode,
-          }),
+        const query = new URLSearchParams({
+          url: videoInfo.sourceUrl,
+          format_id: selectedFormat.formatId,
+          mode,
         });
-        if (!serverResponse.ok) {
-          throw new Error(await responseError(serverResponse, 'Server-side download could not be started.'));
-        }
-
-        const { taskId, cancellationToken } = await serverResponse.json() as DownloadQueuedResponse;
-        if (!taskId) throw new Error('The server did not return a download task ID.');
-        await updateDownloadMutation.mutateAsync({
-          id: downloadRecordId,
-          update: { taskId, cancelToken: cancellationToken, status: 'queued' },
-        });
-        let fileName: string | undefined;
-
-        while (!fileName) {
-          if (isDownloadCancelled(historyRecordId)) {
-            throw new Error('Download cancelled.');
-          }
-          await new Promise<void>((resolve) => setTimeout(resolve, 1000));
-          const statusResponse = await apiFetch(`/download/${encodeURIComponent(taskId)}`);
-          if (!statusResponse.ok) {
-            throw new Error(await responseError(statusResponse, 'Could not read server download status.'));
-          }
-          const taskStatus = await statusResponse.json() as DownloadStatusResponse;
-          if (taskStatus.status === 'cancelled') {
-            throw new Error('Download cancelled.');
-          }
-          if (taskStatus.status === 'failure') {
-            throw new Error(taskStatus.error || 'Server-side video processing failed.');
-          }
-          const status = taskStatus.status === 'queued' ? 'queued' : 'processing';
-          await updateDownloadMutation.mutateAsync({
-            id: downloadRecordId,
-            update: { status },
-          });
-          if (taskStatus.status === 'success') {
-            if (!taskStatus.fileName) throw new Error('Server reported success without a video file.');
-            fileName = taskStatus.fileName;
-          }
-        }
-
-        const targetStreamUrl = `${BACKEND_BASE_URL}/stream/${encodeURIComponent(fileName)}`;
+        const targetStreamUrl = `${BACKEND_BASE_URL}/download/direct?${query.toString()}`;
+        const fileName = `melo_${Date.now()}_${historyRecordId}.mp4`;
         const targetLocalPath = `${localDirectory}${fileName}`;
         temporaryDownloadPath = targetLocalPath;
-        const streamToken = isSocialPlatform ? await ensureAccessToken() : null;
-        if (isSocialPlatform && !streamToken) {
+        const streamToken = mode === 'telegram' ? await ensureAccessToken() : null;
+        if (mode === 'telegram' && !streamToken) {
           throw new Error('Please log in to download this video');
         }
         await updateDownloadMutation.mutateAsync({

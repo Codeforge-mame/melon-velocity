@@ -30,12 +30,14 @@ def build_download_options(
     file_id: str,
     task_temp_dir: str,
     cookie_file: str | None = None,
+    output_dir: str | None = None,
 ) -> dict:
+    output_dir = output_dir or settings.DOWNLOAD_DIR
     options = VideoExtractorService.build_ydl_options(cookie_file)
     options.update(
         {
             "format": f"{format_id}+bestaudio/best",
-            "outtmpl": os.path.join(settings.DOWNLOAD_DIR, f"melo_{file_id}.%(ext)s"),
+            "outtmpl": os.path.join(output_dir, f"melo_{file_id}.%(ext)s"),
             "paths": {"temp": task_temp_dir},
             "merge_output_format": "mp4",
             "postprocessors": [
