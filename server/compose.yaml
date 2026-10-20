@@ -33,6 +33,8 @@ services:
       SOCIAL_COOKIE_ENCRYPTION_KEY: ${SOCIAL_COOKIE_ENCRYPTION_KEY:?Set SOCIAL_COOKIE_ENCRYPTION_KEY in your environment}
       BURNER_YOUTUBE_COOKIES: ${BURNER_YOUTUBE_COOKIES:-}
       BURNER_TIKTOK_COOKIES: ${BURNER_TIKTOK_COOKIES:-}
+      BURNER_YOUTUBE_COOKIES_FILE: /run/secrets/youtube_burner_cookies
+      BURNER_TIKTOK_COOKIES_FILE: /run/secrets/tiktok_burner_cookies
       AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-false}
       AUTH_COOKIE_SAMESITE: ${AUTH_COOKIE_SAMESITE:-lax}
       CORS_ORIGINS: ${CORS_ORIGINS:-}
@@ -40,6 +42,9 @@ services:
       CELERY_RESULT_BACKEND: redis://redis:6379/1
     volumes:
       - ./app/storage:/app/app/storage
+    secrets:
+      - youtube_burner_cookies
+      - tiktok_burner_cookies
     depends_on:
       redis:
         condition: service_healthy
@@ -69,3 +74,9 @@ services:
 
 volumes:
   postgres_data:
+
+secrets:
+  youtube_burner_cookies:
+    file: ../www.youtube.com_cookies.txt
+  tiktok_burner_cookies:
+    file: ../www.tiktok.com_cookies.txt

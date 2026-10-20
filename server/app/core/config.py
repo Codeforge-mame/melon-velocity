@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     SOCIAL_COOKIE_ENCRYPTION_KEY: SecretStr | None = None
     BURNER_YOUTUBE_COOKIES: str | None = None
     BURNER_TIKTOK_COOKIES: str | None = None
+    BURNER_YOUTUBE_COOKIES_FILE: str | None = None
+    BURNER_TIKTOK_COOKIES_FILE: str | None = None
     ACCESS_TOKEN_MINUTES: int = 15
     REFRESH_TOKEN_DAYS: int = 30
     AUTH_COOKIE_SECURE: bool = False

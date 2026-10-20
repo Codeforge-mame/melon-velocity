@@ -136,10 +136,17 @@ authenticated server worker and stream, regardless of the toggle, so the
 authenticated user and detected URL platform.
 The app modes are **Default**, **YouTube**, **Telegram**, and **TikTok**.
 Default mode downloads supported external sites such as Facebook and Instagram
-without cookies. YouTube and TikTok use the server's `BURNER_YOUTUBE_COOKIES`
-and `BURNER_TIKTOK_COOKIES` environment values; no per-user social-cookie record
-is needed for either platform. Set each value to Netscape-format cookie-file
-contents in Render's environment settings. Treat these values as credentials.
+without cookies. YouTube and TikTok use server-wide burner cookies; no per-user
+social-cookie record is needed for either platform. With Compose, the API reads
+the local `../www.youtube.com_cookies.txt` and `../www.tiktok.com_cookies.txt`
+files as read-only secrets. Keep these files outside source control and set
+their permissions to `600`. They are mounted into the API container and are
+never copied into the image. For hosted deployments that inject environment
+secrets instead, set `BURNER_YOUTUBE_COOKIES` and `BURNER_TIKTOK_COOKIES` to the
+Netscape-format file contents. Deployments that mount secret files can set
+`BURNER_YOUTUBE_COOKIES_FILE` and `BURNER_TIKTOK_COOKIES_FILE` to their mounted
+paths; a configured file path takes precedence over the environment value.
+Treat all cookie values and files as credentials.
 Telegram continues to use the user's encrypted cookie session.
 
 `POST /api/v1/info` accepts `{ "url": "...", "mode": "youtube|tiktok|telegram" }`

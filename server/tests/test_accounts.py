@@ -25,7 +25,7 @@ from app.db import Base, get_db
 from app.models import User, UserSocialAccount
 from app.security import verify_password
 from app.services.extractore import VideoExtractorService
-from app.services.social_sessions import temporary_cookie_file
+from app.services.social_sessions import burner_cookie_file, temporary_cookie_file
 from app.services.tasks import build_download_options, download_video_task
 
 
@@ -235,9 +235,36 @@ class AccountFeatureTests(unittest.TestCase):
         self.assertNotEqual(self.client.cookies.get("refresh_token"), first_refresh_token)
 
     def test_burner_metadata_requires_configuration_and_matching_mode(self) -> None:
+        anonymous_info = self.client.post(
+            "/api/v1/info",
+            json={"url": "https://www.youtube.com/watch?v=sample", "mode": "youtube"},
+        )
+        self.assertEqual(anonymous_info.status_code, 401)
+        self.assertEqual(
+            anonymous_info.json()["detail"],
+            "Please log in to download this video",
+        )
+
+        anonymous_download = self.client.get(
+            "/api/v1/download/direct",
+            params={
+                "url": "https://www.youtube.com/watch?v=sample",
+                "format_id": "18",
+                "mode": "youtube",
+            },
+        )
+        self.assertEqual(anonymous_download.status_code, 401)
+
+        email, password = self.create_user()
+        login = self.client.post(
+            "/api/v1/auth/token",
+            data={"username": email, "password": password},
+        )
+        headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
         unconfigured = self.client.post(
             "/api/v1/info",
             json={"url": "https://www.youtube.com/watch?v=sample", "mode": "youtube"},
+            headers=headers,
         )
         self.assertEqual(unconfigured.status_code, 503)
         self.assertEqual(
@@ -252,29 +279,23 @@ class AccountFeatureTests(unittest.TestCase):
                 "resolution": "360p",
                 "mode": "default",
             },
+            headers=headers,
         )
-        self.assertEqual(download.status_code, 400)
+        self.assertEqual(download.status_code, 401)
         self.assertEqual(
             download.json()["detail"],
-            "Switch to YouTube mode to download this URL.",
+            "Please log in to download this video",
         )
 
-        email, password = self.create_user()
-        login = self.client.post(
-            "/api/v1/auth/token",
-            data={"username": email, "password": password},
-        )
-        access_token = login.json()["access_token"]
-        headers = {"Authorization": f"Bearer {access_token}"}
         default_mode = self.client.post(
             "/api/v1/info",
             json={"url": "https://www.youtube.com/watch?v=sample", "mode": "default"},
             headers=headers,
         )
-        self.assertEqual(default_mode.status_code, 400)
+        self.assertEqual(default_mode.status_code, 401)
         self.assertEqual(
             default_mode.json()["detail"],
-            "Switch to YouTube mode to download this URL.",
+            "Please log in to download this video",
         )
         default_download = self.client.post(
             "/api/v1/download",
@@ -286,14 +307,20 @@ class AccountFeatureTests(unittest.TestCase):
             },
             headers=headers,
         )
-        self.assertEqual(default_download.status_code, 400)
+        self.assertEqual(default_download.status_code, 401)
         self.assertEqual(
             default_download.json()["detail"],
-            "Switch to YouTube mode to download this URL.",
+            "Please log in to download this video",
         )
 
-    def test_anonymous_youtube_metadata_uses_and_removes_burner_cookie_file(self) -> None:
+    def test_authenticated_youtube_metadata_uses_and_removes_burner_cookie_file(self) -> None:
         cookie_text = "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tsecret\n"
+        email, password = self.create_user()
+        login = self.client.post(
+            "/api/v1/auth/token",
+            data={"username": email, "password": password},
+        )
+        headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
 
         async def fake_metadata(url: str, cookie_file: str | None = None) -> dict:
             self.assertTrue(cookie_file and os.path.isfile(cookie_file))
@@ -318,12 +345,31 @@ class AccountFeatureTests(unittest.TestCase):
             response = self.client.post(
                 "/api/v1/info",
                 json={"url": "https://www.youtube.com/watch?v=sample", "mode": "youtube"},
+                headers=headers,
             )
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["title"], "Sample video")
         cookie_file = extract_metadata.await_args.args[1]
         self.assertFalse(os.path.exists(cookie_file))
+
+    def test_burner_cookie_file_uses_mounted_secret_without_removing_it(self) -> None:
+        cookie_text = "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tsecret\n"
+        with tempfile.TemporaryDirectory() as secret_dir:
+            secret_path = os.path.join(secret_dir, "youtube-cookies.txt")
+            with open(secret_path, "w", encoding="utf-8") as secret_file:
+                secret_file.write(cookie_text)
+
+            with (
+                patch.object(settings, "BURNER_YOUTUBE_COOKIES_FILE", secret_path),
+                patch.object(settings, "BURNER_YOUTUBE_COOKIES", None),
+                burner_cookie_file("youtube") as cookie_path,
+            ):
+                self.assertEqual(cookie_path, secret_path)
+                with open(cookie_path, encoding="utf-8") as cookie_file:
+                    self.assertEqual(cookie_file.read(), cookie_text)
+
+            self.assertTrue(os.path.isfile(secret_path))
 
     def test_existing_download_cancellation_requires_a_signed_token(self) -> None:
         task_id = str(uuid.uuid4())
@@ -467,11 +513,19 @@ class AccountFeatureTests(unittest.TestCase):
     def test_direct_download_streams_burner_cookie_sandbox_and_cleans_it(self) -> None:
         download_id = uuid.uuid4()
         cookie_text = "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tsecret\n"
+        cookie_paths: list[str] = []
+        email, password = self.create_user()
+        login = self.client.post(
+            "/api/v1/auth/token",
+            data={"username": email, "password": password},
+        )
+        headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
         with tempfile.TemporaryDirectory() as temp_root:
             sandbox = os.path.join(temp_root, f"ytdl_{download_id}")
 
             def fake_download(_url: str, options: dict) -> None:
-                self.assertEqual(options["cookiefile"], os.path.join(sandbox, "cookies.txt"))
+                cookie_paths.append(options["cookiefile"])
+                self.assertTrue(os.path.isfile(options["cookiefile"]))
                 self.assertEqual(options["http_chunk_size"], 5 * 1024 * 1024)
                 self.assertEqual(options["paths"]["temp"], sandbox)
                 with open(options["cookiefile"], encoding="utf-8") as cookie_file:
@@ -493,11 +547,14 @@ class AccountFeatureTests(unittest.TestCase):
                         "format_id": "18",
                         "mode": "youtube",
                     },
+                    headers=headers,
                 )
 
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.content, b"burner video bytes")
             self.assertEqual(response.headers["content-length"], str(len(b"burner video bytes")))
+            self.assertEqual(len(cookie_paths), 1)
+            self.assertFalse(os.path.exists(cookie_paths[0]))
             self.assertFalse(os.path.exists(sandbox))
 
     def test_direct_download_uses_default_mode_without_cookies_for_external_sites(self) -> None:

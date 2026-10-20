@@ -33,7 +33,9 @@ from app.schemas.video import (
 )
 from app.services.extractore import VideoExtractorService
 from app.services.social_sessions import (
+    BurnerCookiesNotConfiguredError,
     SocialAccountMissingError,
+    burner_cookie_file,
     temporary_cookie_file,
 )
 from app.services.tasks import (
@@ -49,12 +51,6 @@ STREAM_FILE_TTL_SECONDS = 6 * 60 * 60
 STREAM_CHUNK_SIZE = 5 * 1024 * 1024
 DIRECT_DOWNLOAD_LIMIT = asyncio.Semaphore(2)
 PLATFORM_DISPLAY_NAMES = {"youtube": "YouTube", "tiktok": "TikTok", "telegram": "Telegram"}
-
-
-def write_cookie_file(file_path: str, cookie_text: str) -> None:
-    descriptor = os.open(file_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as cookie_file:
-        cookie_file.write(cookie_text)
 
 
 def create_cancellation_token(task_id: str, user: User | None) -> str:
@@ -110,21 +106,15 @@ async def get_video_info(
     try:
         platform = VideoExtractorService.platform_for_url(payload.url)
         if platform in {"youtube", "tiktok"}:
-            if payload.mode != platform:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Switch to {PLATFORM_DISPLAY_NAMES[platform]} mode to download this URL.",
-                )
-            cookie_text = getattr(settings, f"BURNER_{platform.upper()}_COOKIES")
-            if not cookie_text:
+            validate_platform_mode(payload.url, payload.mode, user)
+            try:
+                with burner_cookie_file(platform) as cookie_file:
+                    return await VideoExtractorService.extract_metadata(payload.url, cookie_file)
+            except BurnerCookiesNotConfiguredError as exc:
                 raise HTTPException(
                     status_code=503,
                     detail=f"The {PLATFORM_DISPLAY_NAMES[platform]} burner cookies are not configured.",
-                )
-            with tempfile.TemporaryDirectory(prefix=f"ytdl_info_{uuid.uuid4()}_") as info_dir:
-                cookie_file = os.path.join(info_dir, "cookies.txt")
-                write_cookie_file(cookie_file, cookie_text)
-                return await VideoExtractorService.extract_metadata(payload.url, cookie_file)
+                ) from exc
 
         platform = validate_platform_mode(payload.url, payload.mode, user)
         if platform and user:
@@ -168,25 +158,13 @@ async def direct_download(
 
     platform = VideoExtractorService.platform_for_url(url)
     if platform in {"youtube", "tiktok"}:
-        if mode != platform:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Switch to {PLATFORM_DISPLAY_NAMES[platform]} mode to download this URL.",
-            )
-        cookie_text = getattr(settings, f"BURNER_{platform.upper()}_COOKIES")
-        if not cookie_text:
-            raise HTTPException(
-                status_code=503,
-                detail=f"The {PLATFORM_DISPLAY_NAMES[platform]} burner cookies are not configured.",
-            )
+        validate_platform_mode(url, mode, user)
     elif platform == "telegram":
         if validate_platform_mode(url, mode, user) != platform:
             raise HTTPException(status_code=400, detail="Switch to Telegram mode to download this URL.")
-        cookie_text = None
     else:
         if mode != "default":
             raise HTTPException(status_code=400, detail="External URLs must use Default mode.")
-        cookie_text = None
 
     file_id = str(uuid.uuid4())
     sandbox = os.path.join(tempfile.gettempdir(), f"ytdl_{file_id}")
@@ -194,16 +172,12 @@ async def direct_download(
     response_owns_cleanup = False
     try:
         os.makedirs(sandbox, mode=0o700)
-        cookie_file = None
-        if cookie_text:
-            cookie_file = os.path.join(sandbox, "cookies.txt")
-            write_cookie_file(cookie_file, cookie_text)
-
-        if cookie_file:
-            options = build_download_options(
-                format_id, file_id, sandbox, cookie_file, output_dir=sandbox
-            )
-            await _finish_ytdlp_download(url, options)
+        if platform in {"youtube", "tiktok"}:
+            with burner_cookie_file(platform) as cookie_file:
+                options = build_download_options(
+                    format_id, file_id, sandbox, cookie_file, output_dir=sandbox
+                )
+                await _finish_ytdlp_download(url, options)
         elif platform == "telegram" and user:
             with temporary_cookie_file(db, user.id, platform) as user_cookie_file:
                 options = build_download_options(
@@ -241,6 +215,12 @@ async def direct_download(
                 "Cache-Control": "no-store",
             },
         )
+    except BurnerCookiesNotConfiguredError as exc:
+        display_name = PLATFORM_DISPLAY_NAMES.get(platform or "", "social platform")
+        raise HTTPException(
+            status_code=503,
+            detail=f"The {display_name} burner cookies are not configured.",
+        ) from exc
     except Exception as exc:
         logger.exception("Direct video download failed.")
         if isinstance(exc, HTTPException):

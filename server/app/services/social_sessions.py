@@ -20,6 +20,38 @@ class SocialAccountMissingError(Exception):
     pass
 
 
+class BurnerCookiesNotConfiguredError(Exception):
+    pass
+
+
+@contextmanager
+def burner_cookie_file(platform: SocialPlatform) -> Iterator[str]:
+    setting_prefix = f"BURNER_{platform.upper()}_COOKIES"
+    configured_path = getattr(settings, f"{setting_prefix}_FILE")
+    if configured_path:
+        if not os.path.isfile(configured_path) or not os.access(configured_path, os.R_OK):
+            raise BurnerCookiesNotConfiguredError
+        yield configured_path
+        return
+
+    cookie_text = getattr(settings, setting_prefix)
+    if not cookie_text:
+        raise BurnerCookiesNotConfiguredError
+
+    file_descriptor, cookie_path = tempfile.mkstemp(
+        prefix=f"melostream-{platform}-cookies-", suffix=".txt"
+    )
+    try:
+        with os.fdopen(file_descriptor, "w", encoding="utf-8", newline="") as cookie_file:
+            cookie_file.write(cookie_text)
+        yield cookie_path
+    finally:
+        try:
+            os.remove(cookie_path)
+        except FileNotFoundError:
+            pass
+
+
 def _encryption_keys() -> tuple[str, bytes]:
     if not settings.SOCIAL_COOKIE_ENCRYPTION_KEY:
         raise RuntimeError(
