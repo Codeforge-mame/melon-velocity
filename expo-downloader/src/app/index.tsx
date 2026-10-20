@@ -1,4 +1,4 @@
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import {
   ActivityIndicator,
@@ -10,12 +10,13 @@ import {
   TextInput,
   View,
 } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { resolveVideo } from "../app/api/videos";
 import type { VideoFormat } from "../features/downloads/types";
 import { startDownload } from "@/features/downloads/downloadManager";
-import { DownloadQueue } from "@/features/downloads/downloadQueue";
 import { useRouter } from "expo-router";
+import { Sidebar } from "@/components/Sidebar";
 
 function formatBytes(bytes: number | null) {
   if (bytes == null) return "Size unknown";
@@ -24,8 +25,10 @@ function formatBytes(bytes: number | null) {
 }
 
 export default function HomeScreen() {
+  const insets = useSafeAreaInsets();
   const [url, setUrl] = useState("");
   const [selectedFormat, setSelectedFormat] = useState<VideoFormat | null>(null);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const router = useRouter();
 
   const resolver = useMutation({
@@ -65,16 +68,14 @@ export default function HomeScreen() {
         id,
         url: selectedFormat.downloadUrl,
         title: video.title,
+        thumbnailUrl: video.thumbnailUrl ?? undefined,
         filename: `${video.title}.${extension}`,
         formatId: selectedFormat.formatId,
         resolutionLabel: selectedFormat.label,
       });
     },
     onSuccess: () => {
-      Alert.alert(
-        "Download started",
-        "Your video has been added to the download queue.",
-      );
+      router.push("/history");
     },
     onError: (error) => {
       Alert.alert("Download failed to start", error.message);
@@ -82,27 +83,37 @@ export default function HomeScreen() {
   });
 
   return (
-    <ScrollView className="flex-1 bg-slate-950" contentContainerClassName="p-5 pb-12">
-
-      <Pressable
-        onPress={() => router.push("/history")}
-        className="mb-4 rounded-xl bg-slate-800 px-4 py-3"
+    <>
+      <Sidebar isOpen={sidebarOpen} onClose={() => setSidebarOpen(false)} />
+      <ScrollView
+        className="flex-1 bg-gradient-to-b from-slate-950 via-slate-900 to-slate-950"
+        contentContainerStyle={{
+          paddingTop: insets.top + 20,
+          paddingBottom: insets.bottom + 40,
+          paddingHorizontal: 20
+        }}
       >
-        <Text className="text-center font-semibold text-white">
-          View Download history
-        </Text>
-      </Pressable>
+        <View className="flex-row items-center justify-between mb-6">
+          <Pressable
+            onPress={() => setSidebarOpen(true)}
+            className="rounded-2xl bg-slate-800/50 backdrop-blur-sm border border-slate-700/50 px-4 py-3 shadow-lg shadow-black/20"
+          >
+            <Text className="text-2xl font-bold text-white">☰</Text>
+          </Pressable>
+        </View>
 
-      <Text className="mt-8 text-3xl font-bold text-white">
-        Downstream
-      </Text>
-      <Text className="mt-2 text-base text-slate-400">
-        Paste a video link and choose your quality.
-      </Text>
+        <View className="mb-8">
+          <Text className="text-4xl font-bold text-white tracking-tight">
+            Downstream
+          </Text>
+          <Text className="mt-2 text-lg text-slate-400">
+            Paste a video link and choose your quality.
+          </Text>
+        </View>
 
-      <View className="mt-7 rounded-2xl border border-slate-800 bg-slate-900 p-4">
-        <Text className="mb-3 text-sm font-semibold text-slate-300">
-          VIDEO URL
+      <View className="rounded-3xl border border-slate-800/50 bg-slate-900/50 backdrop-blur-sm p-5 shadow-xl shadow-black/30">
+        <Text className="mb-3 text-sm font-semibold text-slate-300 uppercase tracking-wider">
+          Video URL
         </Text>
 
         <TextInput
@@ -114,54 +125,54 @@ export default function HomeScreen() {
           autoCorrect={false}
           keyboardType="url"
           multiline
-          className="min-h-14 rounded-xl border border-slate-700 bg-slate-950 px-3 py-3 text-white"
+          className="min-h-16 rounded-2xl border border-slate-700/50 bg-slate-950/50 px-4 py-4 text-white text-base shadow-inner"
         />
 
         <Pressable
           onPress={submit}
           disabled={resolver.isPending}
-          className="mt-4 items-center rounded-xl bg-indigo-500 p-4"
+          className="mt-5 items-center rounded-2xl bg-gradient-to-r from-indigo-500 to-purple-600 p-4 shadow-lg shadow-indigo-500/25"
         >
           {resolver.isPending ? (
             <ActivityIndicator color="#ffffff" />
           ) : (
-            <Text className="font-bold text-white">Find video</Text>
+            <Text className="font-bold text-white text-lg">Find video</Text>
           )}
         </Pressable>
       </View>
 
       {resolver.isError && (
-        <View className="mt-5 rounded-xl border border-red-900 bg-red-950 p-4">
-          <Text className="font-semibold text-red-300">
+        <View className="mt-5 rounded-2xl border border-red-900/50 bg-red-950/50 backdrop-blur-sm p-5 shadow-lg shadow-red-900/20">
+          <Text className="font-semibold text-red-300 text-lg">
             Could not resolve this video
           </Text>
           <Text className="mt-2 text-sm text-red-200">
             {resolver.error.message}
           </Text>
-          <Pressable onPress={() => resolver.mutate(url.trim())} className="mt-3">
-            <Text className="font-bold text-white">Try again</Text>
+          <Pressable onPress={() => resolver.mutate(url.trim())} className="mt-4">
+            <Text className="font-bold text-white text-base">Try again</Text>
           </Pressable>
         </View>
       )}
 
       {video && (
-        <View className="mt-6">
+        <View className="mt-8">
           {video.thumbnailUrl && (
             <Image
               source={{ uri: video.thumbnailUrl }}
-              className="h-48 w-full rounded-2xl bg-slate-800"
+              className="h-56 w-full rounded-3xl bg-slate-800 shadow-xl shadow-black/30"
               resizeMode="cover"
             />
           )}
 
-          <Text className="mt-4 text-xl font-bold text-white">
+          <Text className="mt-5 text-2xl font-bold text-white">
             {video.title}
           </Text>
-          <Text className="mt-2 text-sm text-slate-400">
+          <Text className="mt-2 text-base text-slate-400">
             {video.formats.length} available formats
           </Text>
 
-          <Text className="mb-3 mt-6 text-lg font-bold text-white">
+          <Text className="mb-4 mt-8 text-xl font-bold text-white">
             Select resolution
           </Text>
 
@@ -173,22 +184,24 @@ export default function HomeScreen() {
                 key={format.formatId}
                 onPress={() => setSelectedFormat(format)}
 
-                className={`mb-3 flex-row items-center justify-between rounded-xl border p-4 ${selected
-                  ? "border-indigo-400 bg-indigo-950"
-                  : "border-slate-800 bg-slate-900"
+                className={`mb-3 flex-row items-center justify-between rounded-2xl border p-5 shadow-md ${selected
+                  ? "border-indigo-400/50 bg-indigo-950/50 backdrop-blur-sm shadow-indigo-500/20"
+                  : "border-slate-800/50 bg-slate-900/50 backdrop-blur-sm shadow-black/10"
                   }`}
               >
                 <View className="flex-1">
-                  <Text className="font-semibold text-white">
+                  <Text className="font-semibold text-white text-lg">
                     {format.label}
                   </Text>
                   <Text className="mt-1 text-sm text-slate-400">
                     {format.container.toUpperCase()} · {formatBytes(format.fileSizeBytes)}
                   </Text>
                 </View>
-                <Text className="ml-3 font-bold text-indigo-300">
-                  {selected ? "Selected" : "Select"}
-                </Text>
+                <View className={`ml-4 rounded-xl px-3 py-1.5 ${selected ? 'bg-indigo-500' : 'bg-slate-700'}`}>
+                  <Text className={`font-bold text-sm ${selected ? 'text-white' : 'text-slate-300'}`}>
+                    {selected ? "✓" : "Select"}
+                  </Text>
+                </View>
               </Pressable>
             );
           })}
@@ -197,13 +210,13 @@ export default function HomeScreen() {
             <Pressable
               onPress={() => downloadMutation.mutate()}
               disabled={downloadMutation.isPending}
-              className="mt-4 items-center rounded-xl bg-indigo-500 p-4"
+              className="mt-6 items-center rounded-2xl bg-gradient-to-r from-indigo-500 to-purple-600 p-5 shadow-xl shadow-indigo-500/30"
             >
               {
                 downloadMutation.isPending ? (
                   <ActivityIndicator color={"#fff"} />
                 ) : (
-                  <Text className="font-bold text-white">
+                  <Text className="font-bold text-white text-lg">
                     Download {selectedFormat.label}
                   </Text>
                 )
@@ -212,7 +225,7 @@ export default function HomeScreen() {
           )}
         </View>
       )}
-      <DownloadQueue />
     </ScrollView>
+    </>
   );
 }

@@ -1,4 +1,4 @@
-import * as MediaLibrary from "expo-media-library";
+import * as MediaLibrary from "expo-media-library/legacy";
 import {
     completeHandler,
     createDownloadTask,
@@ -13,6 +13,7 @@ type DownloadInput = {
     id: string;
     url: string;
     title: string;
+    thumbnailUrl?: string;
     filename: string;
     formatId?: string;
     resolutionLabel?: string;
@@ -177,12 +178,13 @@ export async function startDownload(input: DownloadInput) {
     const destination = `${directories.documents}/${input.id}-${filename}`;
 
     await db.runAsync(`INSERT INTO downloads(
-            id, source_url, title, format_id, resolution_label,
+            id, source_url, title, thumbnail_url, format_id, resolution_label,
             file_name, status, task_id, downloaded_bytes, updated_at
-        ) VALUES(?, ?, ?, ?, ?, ?, 'queued', ?, 0, CURRENT_TIMESTAMP)`,
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, 'queued', ?, 0, CURRENT_TIMESTAMP)`,
         input.id,
         input.url,
         input.title,
+        input.thumbnailUrl ?? null,
         input.formatId ?? null,
         input.resolutionLabel ?? null,
         filename,
@@ -227,11 +229,12 @@ export async function retryDownload(id: string) {
     const row = await db.getFirstAsync<{
         source_url: string;
         title: string | null;
+        thumbnail_url: string | null;
         file_name: string;
         format_id: string | null;
         resolution_label: string | null;
     }>(
-        `SELECT source_url, title, file_name, format_id, resolution_label
+        `SELECT source_url, title, thumbnail_url, file_name, format_id, resolution_label
 FROM downloads WHERE id = ?`,
         id,
     );
@@ -240,10 +243,13 @@ FROM downloads WHERE id = ?`,
 
     await db.runAsync("DELETE FROM downloads WHERE id = ?", id);
 
+    const thumbnail_url = row.thumbnail_url ?? undefined;
+
     await startDownload({
         id: `${id} - retry - ${Date.now()}`,
         url: row.source_url,
         title: row.title ?? row.file_name,
+        thumbnailUrl: thumbnail_url,
         filename: row.file_name,
         formatId: row.format_id ?? undefined,
         resolutionLabel: row.resolution_label ?? undefined,
@@ -281,6 +287,77 @@ export async function retryGallerySave(downloadId: string) {
     await updateDownload(downloadId, {
         errorMessage: null,
     });
+}
+
+export async function deleteDownload(id: string) {
+    const db = await getDatabase();
+
+    // First, get the download info to check if we need to delete the file
+    const row = await db.getFirstAsync<{
+        file_uri: string | null;
+        task_id: string | null;
+    }>(
+        `SELECT file_uri, task_id FROM downloads WHERE id = ?`,
+        id,
+    );
+
+    if (!row) {
+        throw new Error("Download record not found.");
+    }
+
+    // Delete from database
+    await db.runAsync("DELETE FROM downloads WHERE id = ?", id);
+
+    // Optionally delete the file from filesystem if needed
+    // This is commented out as the file might still be in use by gallery
+    // if (row.file_uri) {
+    //     try {
+    //         const FileSystem = require("expo-file-system");
+    //         await FileSystem.deleteAsync(row.file_uri);
+    //     } catch (error) {
+    //         console.warn("Failed to delete file:", error);
+    //     }
+    // }
+}
+
+export async function deleteFromGallery(downloadId: string) {
+    const db = await getDatabase();
+
+    const row = await db.getFirstAsync<{
+        gallery_asset_id: string | null;
+        gallery_saved: number;
+    }>(
+        `SELECT gallery_asset_id, gallery_saved FROM downloads WHERE id = ?`,
+        downloadId,
+    );
+
+    if (!row) {
+        throw new Error("Download record not found.");
+    }
+
+    if (row.gallery_saved !== 1 || !row.gallery_asset_id) {
+        throw new Error("Video is not saved in the gallery.");
+    }
+
+    try {
+        await MediaLibrary.deleteAssetsAsync([row.gallery_asset_id]);
+
+        // Update database to reflect gallery deletion
+        await db.runAsync(`
+            UPDATE downloads
+            SET gallery_asset_id = NULL,
+                gallery_saved = 0,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?`,
+            downloadId,
+        );
+    } catch (error) {
+        throw new Error(
+            error instanceof Error
+                ? `Failed to delete from gallery: ${error.message}`
+                : "Failed to delete from gallery."
+        );
+    }
 }
 
 async function reconcileCompletedTask(task: NativeTask) {

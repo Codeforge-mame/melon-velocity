@@ -4,6 +4,7 @@ import { ActivityIndicator, View } from "react-native";
 import { QueryProvider } from "@/providers/QueryProvider";
 import { initializeDatabase } from "@/db/database";
 import { recoverDownloads } from "@/features/downloads/downloadManager";
+import "../../global.css"
 
 export default function RootLayout() {
   const [ready, setReady] = useState(false);
