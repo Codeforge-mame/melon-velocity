@@ -1,0 +1,40 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - APP_ENV=development
+      - LOG_LEVEL=DEBUG
+      - RESOLVE_TIMEOUT_SECONDS=25
+      - RATE_LIMIT_REQUESTS=10
+      - RATE_LIMIT_WINDOW_SECONDS=600
+      - REDIS_URL=redis://redis:6379/0
+      - CACHE_TTL_SECONDS=3600
+      - DATABASE_URL=sqlite:///./data/app.db
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./app:/app/app
+      - ./tests:/app/tests
+      - ./data:/app/data
+    command: .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+volumes:
+  redis_data:

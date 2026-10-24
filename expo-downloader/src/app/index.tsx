@@ -32,7 +32,7 @@ export default function HomeScreen() {
   const router = useRouter();
 
   const resolver = useMutation({
-    mutationFn: resolveVideo,
+    mutationFn: (url: string) => resolveVideo(url),
     onSuccess: () => setSelectedFormat(null),
   });
 
@@ -48,6 +48,25 @@ export default function HomeScreen() {
   };
 
   const video = resolver.data;
+
+  // Group formats by category
+  const groupedFormats = video ? {
+    video: video.formats.filter(f => f.category === 'video'),
+    'video-only': video.formats.filter(f => f.category === 'video-only'),
+    'audio-only': video.formats.filter(f => f.category === 'audio-only'),
+  } : { video: [], 'video-only': [], 'audio-only': [] };
+
+  const categoryTitles: Record<string, string> = {
+    video: 'Video + Audio (Recommended)',
+    'video-only': 'Video Only',
+    'audio-only': 'Audio Only',
+  };
+
+  const categoryDescriptions: Record<string, string> = {
+    video: 'Complete video files with both video and audio',
+    'video-only': 'Video without audio (may require separate audio download)',
+    'audio-only': 'Audio only (for music or podcasts)',
+  };
 
   // download mutaion
   const downloadMutation = useMutation({
@@ -169,40 +188,57 @@ export default function HomeScreen() {
             {video.title}
           </Text>
           <Text className="mt-2 text-base text-slate-400">
-            {video.formats.length} available formats
+            {Object.values(groupedFormats).flat().length} available formats
           </Text>
 
           <Text className="mb-4 mt-8 text-xl font-bold text-white">
             Select resolution
           </Text>
 
-          {video.formats.map((format) => {
-            const selected = selectedFormat?.formatId === format.formatId;
+          {Object.entries(groupedFormats).map(([category, formats]) => {
+            if (formats.length === 0) return null;
 
             return (
-              <Pressable
-                key={format.formatId}
-                onPress={() => setSelectedFormat(format)}
+              <View key={category} className="mb-6">
+                <View className="mb-3">
+                  <Text className="text-lg font-bold text-white">
+                    {categoryTitles[category]}
+                  </Text>
+                  <Text className="text-sm text-slate-400">
+                    {categoryDescriptions[category]}
+                  </Text>
+                </View>
 
-                className={`mb-3 flex-row items-center justify-between rounded-2xl border p-5 shadow-md ${selected
-                  ? "border-indigo-400/50 bg-indigo-950/50 backdrop-blur-sm shadow-indigo-500/20"
-                  : "border-slate-800/50 bg-slate-900/50 backdrop-blur-sm shadow-black/10"
-                  }`}
-              >
-                <View className="flex-1">
-                  <Text className="font-semibold text-white text-lg">
-                    {format.label}
-                  </Text>
-                  <Text className="mt-1 text-sm text-slate-400">
-                    {format.container.toUpperCase()} · {formatBytes(format.fileSizeBytes)}
-                  </Text>
-                </View>
-                <View className={`ml-4 rounded-xl px-3 py-1.5 ${selected ? 'bg-indigo-500' : 'bg-slate-700'}`}>
-                  <Text className={`font-bold text-sm ${selected ? 'text-white' : 'text-slate-300'}`}>
-                    {selected ? "✓" : "Select"}
-                  </Text>
-                </View>
-              </Pressable>
+                {formats.map((format) => {
+                  const selected = selectedFormat?.formatId === format.formatId;
+
+                  return (
+                    <Pressable
+                      key={format.formatId}
+                      onPress={() => setSelectedFormat(format)}
+
+                      className={`mb-3 flex-row items-center justify-between rounded-2xl border p-5 shadow-md ${selected
+                        ? "border-indigo-400/50 bg-indigo-950/50 backdrop-blur-sm shadow-indigo-500/20"
+                        : "border-slate-800/50 bg-slate-900/50 backdrop-blur-sm shadow-black/10"
+                        }`}
+                    >
+                      <View className="flex-1">
+                        <Text className="font-semibold text-white text-lg">
+                          {format.label}
+                        </Text>
+                        <Text className="mt-1 text-sm text-slate-400">
+                          {format.container.toUpperCase()} · {formatBytes(format.fileSizeBytes)}
+                        </Text>
+                      </View>
+                      <View className={`ml-4 rounded-xl px-3 py-1.5 ${selected ? 'bg-indigo-500' : 'bg-slate-700'}`}>
+                        <Text className={`font-bold text-sm ${selected ? 'text-white' : 'text-slate-300'}`}>
+                          {selected ? "✓" : "Select"}
+                        </Text>
+                      </View>
+                    </Pressable>
+                  );
+                })}
+              </View>
             );
           })}
 

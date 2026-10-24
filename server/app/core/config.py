@@ -1,43 +1,53 @@
-import os
-from typing import Literal
-
-from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+
 class Settings(BaseSettings):
+    """Application configuration loaded from environment variables."""
+
     model_config = SettingsConfigDict(
         env_file=".env",
-        case_sensitive=True,
+        env_file_encoding="utf-8",
+        case_sensitive=False,
         extra="ignore",
     )
 
-    PROJECT_NAME: str = "MeloStream Engine Backend"
-    API_V1_STR: str = "/api/v1"
-    DATABASE_URL: str = "postgresql+psycopg://melostream:Mame33@localhost:5432/melostream"
-    REDIS_URL: str = "redis://localhost:6379/2"
-    JWT_SECRET_KEY: SecretStr | None = None
-    SOCIAL_COOKIE_ENCRYPTION_KEY: SecretStr | None = None
-    BURNER_YOUTUBE_COOKIES: str | None = None
-    BURNER_TIKTOK_COOKIES: str | None = None
-    BURNER_YOUTUBE_COOKIES_FILE: str | None = None
-    BURNER_TIKTOK_COOKIES_FILE: str | None = None
-    ACCESS_TOKEN_MINUTES: int = 15
-    REFRESH_TOKEN_DAYS: int = 30
-    AUTH_COOKIE_SECURE: bool = False
-    AUTH_COOKIE_SAMESITE: Literal["lax", "strict", "none"] = "lax"
-    CORS_ORIGINS: str = ""
+    app_env: str = "development"
+    log_level: str = "INFO"
 
-    # Storage allocation directories
-    BASE_DIR: str = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    DOWNLOAD_DIR: str = os.path.join(BASE_DIR, "storage", "downloads")
-    TEMP_DIR: str = os.path.join(BASE_DIR, "storage", "temp")
+    # yt-dlp extraction settings
+    resolve_timeout_seconds: int = 25
+    max_concurrent_resolves: int = 1
 
-    # Rate limiting configuration
-    RATE_LIMIT_MAX_TOKENS: int = 5
-    RATE_LIMIT_REFILL_INTERVAL: int = 30  # Refill 1 token every 30 seconds
+    # Rate limiting settings
+    rate_limit_requests: int = 10
+    rate_limit_window_seconds: int = 600  # 10 minutes
+
+    # Installation ID validation
+    installation_id_min_length: int = 16
+    installation_id_max_length: int = 128
+
+    # Redis settings
+    redis_url: str = "redis://localhost:6379/0"
+    cache_ttl_seconds: int = 3600  # 1 hour
+
+    # Database settings
+    database_url: str = "sqlite:///./app.db"
+
+    # API authentication
+    jwt_secret_key: str = "change-this-in-production"
+    jwt_algorithm: str = "HS256"
+    jwt_expiration_hours: int = 24
+
+    # Request queue
+    queue_max_size: int = 100
+
+    @property
+    def is_production(self) -> bool:
+        return self.app_env.lower() == "production"
+
+    @property
+    def is_development(self) -> bool:
+        return self.app_env.lower() == "development"
+
 
 settings = Settings()
-
-# Ensure directories exist physically on boot
-os.makedirs(settings.DOWNLOAD_DIR, exist_ok=True)
-os.makedirs(settings.TEMP_DIR, exist_ok=True)

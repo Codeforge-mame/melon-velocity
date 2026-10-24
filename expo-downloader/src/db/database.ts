@@ -48,7 +48,12 @@ export async function initializeDatabase() {
          gallery_saved INTEGER NOT NULL DEFAULT 0,
          completed_at TEXT,
          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+         queue_position INTEGER,
+         retry_count INTEGER NOT NULL DEFAULT 0,
+         last_retry_at TEXT,
+         started_at TEXT,
+         added_at TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_downloads_created_at ON downloads(created_at DESC);
@@ -57,4 +62,9 @@ export async function initializeDatabase() {
     await ensureColumn(db, "completed_at", "TEXT");
     await ensureColumn(db, "gallery_asset_id", "TEXT");
     await ensureColumn(db, "gallery_saved", "INTEGER NOT NULL DEFAULT 0");
+    await ensureColumn(db, "queue_position", "INTEGER");
+    await ensureColumn(db, "retry_count", "INTEGER NOT NULL DEFAULT 0");
+    await ensureColumn(db, "last_retry_at", "TEXT");
+    await ensureColumn(db, "started_at", "TEXT");
+    await ensureColumn(db, "added_at", "TEXT");
 }

@@ -5,6 +5,14 @@ export type VideoFormat = {
     fileSizeBytes: number | null;
     downloadUrl: string;
     requiresAuthorization?: boolean;
+    category: 'video' | 'video-only' | 'audio-only';
+    height?: number | null;
+};
+
+export type Subtitle = {
+    language: string;
+    url: string;
+    ext: string;
 };
 
 export type ResolvedVideo = {
@@ -13,4 +21,5 @@ export type ResolvedVideo = {
     thumbnailUrl: string | null;
     durationSeconds: number | null;
     formats: VideoFormat[];
+    subtitles: Subtitle[];
 };

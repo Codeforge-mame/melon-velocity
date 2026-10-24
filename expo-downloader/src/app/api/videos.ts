@@ -1,60 +1,112 @@
 import type { ResolvedVideo } from "@/features/downloads/types";
+import { getInstallationId } from "@/utils/installationId";
+import { qualityPresetsManager } from "@/features/quality/qualityPresets";
+import { networkQualityDetector } from "@/features/network/networkQuality";
 
-// const API_URL = process.env.EXPO_PUBLIC_API_URL?.replace(/\/+$/, "");
-const API_URL = "https://cornaceous-abolitionary-bev.ngrok-free.dev"
+const API_URL = process.env.EXPO_PUBLIC_API_URL?.replace(/\/+$/, "") || "https://cornaceous-abolitionary-bev.ngrok-free.dev";
 
-export async function resolveVideo(url: string): Promise<ResolvedVideo> {
+interface ErrorResponse {
+    code: string;
+    message: string;
+}
+
+interface HealthResponse {
+    status: string;
+}
+
+/**
+ * Check if the backend API is healthy
+ */
+export async function checkHealth(): Promise<boolean> {
+    try {
+        const response = await fetch(`${API_URL}/health`);
+        const data: HealthResponse = await response.json();
+        return data.status === "ok";
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Resolve video metadata and formats using the FastAPI backend
+ */
+export async function resolveVideo(url: string, qualityPreset?: string): Promise<ResolvedVideo> {
     if (!API_URL) {
         throw new Error("EXPO_PUBLIC_API_URL is not configured.");
     }
 
-    // Attempt FastAPI backend (/api/v1/info), fallback to /v1/videos/resolve
-    let endpoint = `${API_URL}/api/v1/info`;
-    let response = await fetch(endpoint, {
+    const installationId = await getInstallationId();
+    
+    // Get filter params from quality preset if provided
+    let filterParams: any = {};
+    if (qualityPreset) {
+        filterParams = qualityPresetsManager.getFilterParams(qualityPreset);
+    } else {
+        // Auto-select based on network quality
+        const networkInfo = await networkQualityDetector.getCurrentNetworkInfo();
+        const autoPreset = qualityPresetsManager.getPresetForNetwork(networkInfo.quality);
+        filterParams = qualityPresetsManager.getFilterParams(autoPreset.id);
+    }
+
+    const response = await fetch(`${API_URL}/v1/videos/resolve`, {
         method: "POST",
         headers: {
             "Content-Type": "application/json",
+            "X-Installation-ID": installationId,
         },
-        body: JSON.stringify({ url, mode: "default" }),
+        body: JSON.stringify({ 
+            url,
+            ...filterParams
+        }),
     });
 
-    if (response.status === 404) {
-        endpoint = `${API_URL}/v1/videos/resolve`;
-        response = await fetch(endpoint, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-            },
-            body: JSON.stringify({ url }),
-        });
-    }
-
     if (!response.ok) {
-        let message = "";
+        let errorMessage = `Video resolution failed (${response.status})`;
+        
         try {
-            const errJson = await response.json();
-            message = errJson.detail || errJson.message || "";
+            const errJson: ErrorResponse = await response.json();
+            errorMessage = errJson.message || errorMessage;
+            
+            // Map backend error codes to user-friendly messages
+            const errorMessages: Record<string, string> = {
+                INVALID_URL: "Invalid URL. Please check the link and try again.",
+                UNSUPPORTED_SITE: "This website is not supported.",
+                AGE_OR_ACCESS_RESTRICTION: "This video requires authentication or has age restrictions.",
+                VIDEO_UNAVAILABLE: "This video is not available or has been removed.",
+                SOURCE_TIMEOUT: "The video source did not respond in time. Please try again.",
+                EXTRACTION_FAILED: "Failed to extract video information. Please try again.",
+                RATE_LIMITED: "Too many requests. Please wait a moment and try again.",
+                SERVER_BUSY: "The server is busy. Please try again later.",
+            };
+            
+            if (errJson.code && errorMessages[errJson.code]) {
+                errorMessage = errorMessages[errJson.code];
+            }
         } catch {
-            message = await response.text();
+            // If parsing fails, use the status-based message
         }
-        throw new Error(message || `Video resolution failed (${response.status})`);
+        
+        throw new Error(errorMessage);
     }
 
     const data = await response.json();
 
-    // Support both FastAPI VideoMetadataResponse and ResolvedVideo format
+    // Backend returns camelCase fields matching our types
     return {
-        sourceUrl: data.sourceUrl ?? data.source_url ?? url,
+        sourceUrl: data.sourceUrl || url,
         title: data.title || "Untitled Video",
-        thumbnailUrl: data.thumbnailUrl ?? data.thumbnail ?? null,
-        durationSeconds: data.durationSeconds ?? data.duration ?? null,
+        thumbnailUrl: data.thumbnailUrl || null,
+        durationSeconds: data.durationSeconds || null,
         formats: (data.formats || []).map((f: any) => ({
-            formatId: f.formatId ?? f.format_id ?? String(Math.random()),
-            label: f.label ?? f.resolution ?? "Standard",
-            container: f.container ?? f.extension ?? "mp4",
-            fileSizeBytes: f.fileSizeBytes ?? f.fileSizeEstimate ?? f.file_size_estimate ?? null,
-            downloadUrl: f.downloadUrl ?? f.url,
-            requiresAuthorization: f.requiresAuthorization ?? false,
+            formatId: f.formatId || String(Math.random()),
+            label: f.label || "Standard",
+            container: f.container || "mp4",
+            fileSizeBytes: f.fileSizeBytes || null,
+            downloadUrl: f.downloadUrl || "",
+            requiresAuthorization: f.requiresAuthorization || false,
+            category: f.category || "video",
+            height: f.height || null,
         })),
+        subtitles: data.subtitles || [],
     };
 }

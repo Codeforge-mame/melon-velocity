@@ -4,6 +4,9 @@ import { ActivityIndicator, View } from "react-native";
 import { QueryProvider } from "@/providers/QueryProvider";
 import { initializeDatabase } from "@/db/database";
 import { recoverDownloads } from "@/features/downloads/downloadManager";
+import { preferencesManager } from "@/features/preferences/preferencesManager";
+import { notificationManager } from "@/features/notifications/notificationManager";
+import { networkQualityDetector } from "@/features/network/networkQuality";
 import "../../global.css"
 
 export default function RootLayout() {
@@ -17,6 +20,9 @@ export default function RootLayout() {
       try {
         await initializeDatabase();
         await recoverDownloads();
+        await preferencesManager.loadPreferences();
+        await notificationManager.initialize();
+        await networkQualityDetector.initialize();
 
         if (mounted) setReady(true);
       } catch (error) {

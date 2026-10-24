@@ -1,4 +1,4 @@
-import * as MediaLibrary from "expo-media-library/legacy";
+import * as MediaLibrary from "expo-media-library";
 import {
     completeHandler,
     createDownloadTask,
@@ -8,6 +8,10 @@ import {
 } from "@kesha-antonov/react-native-background-downloader";
 
 import { getDatabase } from "../../db/database";
+import { downloadQueue } from "./downloadQueue";
+import { retryManager } from "./retryManager";
+import { notificationManager } from "../notifications/notificationManager";
+import { preferencesManager } from "../preferences/preferencesManager";
 
 type DownloadInput = {
     id: string;
@@ -141,6 +145,9 @@ function attachCallbacks(task: NativeTask) {
                     completed: true,
                 });
 
+                await downloadQueue.markCompleted(task.id);
+                await retryManager.resetRetryCount(task.id);
+
                 try {
                     await saveToGalleryForDownload(task.id, location);
                 } catch (error) {
@@ -161,14 +168,25 @@ function attachCallbacks(task: NativeTask) {
                 completeHandler(task.id);
             }
         })
-        .error(({ error, errorCode }) => {
-            void updateDownload(task.id, {
+        .error(async ({ error, errorCode }) => {
+            await updateDownload(task.id, {
                 status: "failed",
                 errorMessage: `${error}(code ${errorCode})`,
-            }).finally(() => {
-                activeTasks.delete(task.id);
-                attachedTasks.delete(task.id);
             });
+            
+            await downloadQueue.markFailed(task.id, `${error}(code ${errorCode})`);
+            await retryManager.incrementRetryCount(task.id);
+            
+            const prefs = preferencesManager.getPreferences();
+            if (prefs?.enableAutoRetry && await retryManager.shouldRetry(task.id)) {
+                await retryManager.markForRetry(task.id);
+            }
+            
+            const title = (task.metadata?.title as string) || "Unknown";
+            await notificationManager.showDownloadFailed(task.id, title, `${error}(code ${errorCode})`);
+            
+            activeTasks.delete(task.id);
+            attachedTasks.delete(task.id);
         });
 }
 
@@ -179,8 +197,8 @@ export async function startDownload(input: DownloadInput) {
 
     await db.runAsync(`INSERT INTO downloads(
             id, source_url, title, thumbnail_url, format_id, resolution_label,
-            file_name, status, task_id, downloaded_bytes, updated_at
-        ) VALUES(?, ?, ?, ?, ?, ?, ?, 'queued', ?, 0, CURRENT_TIMESTAMP)`,
+            file_name, status, task_id, downloaded_bytes, updated_at, added_at
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, 'queued', ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
         input.id,
         input.url,
         input.title,
@@ -190,6 +208,18 @@ export async function startDownload(input: DownloadInput) {
         filename,
         input.id,
     );
+
+    await downloadQueue.addToQueue({
+        id: input.id,
+        url: input.url,
+        title: input.title,
+        thumbnailUrl: input.thumbnailUrl,
+        filename,
+        formatId: input.formatId,
+        resolutionLabel: input.resolutionLabel,
+    });
+
+    await notificationManager.showDownloadStarted(input.id, input.title);
 
     const task = createDownloadTask({
         id: input.id,
@@ -214,6 +244,9 @@ export async function pauseDownload(id: string) {
 
     await task.pause();
     await updateDownload(id, { status: "paused" });
+    await downloadQueue.pauseDownload(id);
+    const title = (task.metadata?.title as string) || "Unknown";
+    await notificationManager.showDownloadPaused(id, title);
 }
 
 export async function resumeDownload(id: string) {
@@ -222,6 +255,7 @@ export async function resumeDownload(id: string) {
 
     await task.resume();
     await updateDownload(id, { status: "downloading" });
+    await downloadQueue.resumeDownload(id);
 }
 
 export async function retryDownload(id: string) {

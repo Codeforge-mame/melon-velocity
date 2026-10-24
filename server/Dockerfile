@@ -1,23 +1,27 @@
+# Use Python 3.12 slim image
 FROM python:3.12-slim
 
-ENV PYTHONUNBUFFERED=1 \
-    UV_PROJECT_ENVIRONMENT=/app/.venv
-
-RUN apt-get update \
-    && apt-get install --no-install-recommends -y ca-certificates ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY --from=ghcr.io/astral-sh/uv:0.11.31 /uv /uvx /bin/
-
+# Set working directory
 WORKDIR /app
+
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+# Copy dependency files
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev --no-install-project \
-    && uv pip install --python /app/.venv/bin/python --upgrade "yt-dlp[default,curl-cffi]"
 
-COPY app ./app
-COPY alembic.ini ./alembic.ini
-COPY migrations ./migrations
+# Install dependencies using uv
+RUN uv sync --frozen --no-dev
 
+# Copy application code
+COPY . .
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1
+ENV APP_ENV=development
+
+# Expose port (Render sets PORT dynamically)
 EXPOSE 8000
 
-CMD ["uv", "run", "--no-sync", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Run the application
+CMD ["uv", "run", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

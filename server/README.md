@@ -1,199 +1,411 @@
-# MeloStream server
+# Video Resolver API
 
-## Run the API, PostgreSQL, Redis, and Celery worker
+A FastAPI + yt-dlp backend for resolving video metadata and download formats. Designed for integration with mobile applications that download media directly from source URLs.
 
-Copy `.env.example` to `.env`, replace both secret placeholders with generated
-values, then start the services from this directory:
+## Architecture
 
-```sh
+The server follows a layered architecture:
+
+- **API Layer** (`app/api/routes/`): FastAPI route handlers for health checks and video resolution
+- **Schema Layer** (`app/schema/`): Pydantic models for request/response validation
+- **Service Layer** (`app/services/`): Business logic for video resolution using yt-dlp
+- **Core Layer** (`app/core/`): Configuration and rate limiting
+- **Utils Layer** (`app/utils/`): URL validation and security utilities
+
+### Design Principles
+
+- **Direct-to-source downloads**: The server only extracts metadata; the mobile app downloads media directly
+- **Stateless**: No persistent storage or caching of temporary media URLs
+- **Rate-limited**: Per-client quotas to prevent abuse
+- **Secure**: URL validation, SSRF protection, and bounded resource usage
+- **Lightweight**: Optimized for Render's free tier with minimal memory/CPU footprint
+
+## API Endpoints
+
+### GET /health
+
+Health check endpoint (does not count against rate limits).
+
+**Response:**
+```json
+{
+  "status": "ok"
+}
+```
+
+**Example:**
+```bash
+curl http://localhost:8000/health
+```
+
+### POST /v1/videos/resolve
+
+Resolve video metadata and available download formats.
+
+**Headers:**
+- `X-Installation-ID`: Optional client identifier for rate limiting (16-128 alphanumeric characters)
+
+**Request:**
+```json
+{
+  "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+}
+```
+
+**Response:**
+```json
+{
+  "sourceUrl": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+  "title": "Example Video Title",
+  "thumbnailUrl": "https://i.ytimg.com/vi/dQw4w9WgXcQ/maxresdefault.jpg",
+  "durationSeconds": 213,
+  "formats": [
+    {
+      "formatId": "137",
+      "label": "1080p MP4 30fps",
+      "container": "mp4",
+      "fileSizeBytes": 25000000,
+      "downloadUrl": "https://example.com/temporary-media-url",
+      "requiresAuthorization": false
+    }
+  ]
+}
+```
+
+**Error Response:**
+```json
+{
+  "code": "INVALID_URL",
+  "message": "URL must not contain credentials"
+}
+```
+
+**Example:**
+```bash
+curl -X POST http://localhost:8000/v1/videos/resolve \
+  -H "Content-Type: application/json" \
+  -H "X-Installation-ID: abc123def456" \
+  -d '{"url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"}'
+```
+
+### Error Codes
+
+| Code | HTTP Status | Description |
+|------|-------------|-------------|
+| INVALID_URL | 400 | URL is malformed, uses unsupported scheme, or contains credentials |
+| UNSUPPORTED_SITE | 400 | Website is not supported by yt-dlp or has no downloadable formats |
+| AGE_OR_ACCESS_RESTRICTION | 403 | Video requires authentication, has age restrictions, or is private |
+| VIDEO_UNAVAILABLE | 404 | Video is not found or has been removed |
+| SOURCE_TIMEOUT | 504 | Video source did not respond within timeout |
+| EXTRACTION_FAILED | 500 | Unexpected error during metadata extraction |
+| RATE_LIMITED | 429 | Rate limit exceeded (includes Retry-After header) |
+| SERVER_BUSY | 503 | Server is at capacity |
+
+## Installation
+
+### Prerequisites
+
+- Python 3.12 or higher
+- uv package manager
+- FFmpeg (for yt-dlp compatibility)
+
+### Local Setup
+
+1. Clone the repository:
+```bash
+cd server
+```
+
+2. Install dependencies:
+```bash
+uv sync
+```
+
+3. Create environment file:
+```bash
 cp .env.example .env
-# Generate JWT_SECRET_KEY with: openssl rand -hex 32
-# Generate SOCIAL_COOKIE_ENCRYPTION_KEY with:
-# uv run python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-docker compose up --build
 ```
 
-The API is available on port `8000`. PostgreSQL data is persisted in the
-`postgres_data` Compose volume. The API and worker share `app/storage` for
-completed video files and temporary extraction data. Compose does not run database migrations automatically. To apply the checked-in
-migration manually, run this from the `server` directory:
-
-```sh
-docker compose run --rm api uv run --no-sync alembic upgrade head
+4. Start the server:
+```bash
+uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-This runs Alembic in the API container, where the Compose database hostname
-`postgres` resolves correctly. The migration is already checked in at
-`migrations/versions/20261007_01_create_user_accounts.py`; do not create another
-initial revision with `alembic revision --autogenerate`.
+The API will be available at `http://127.0.0.1:8000`
 
-To run Alembic directly from the host instead, PostgreSQL must be published to
-the host and `DATABASE_URL` must use `localhost` (not the Compose-only hostname
-`postgres`), for example:
-`postgresql+psycopg://melostream:<password>@localhost:5432/melostream`.
+Interactive API documentation: `http://127.0.0.1:8000/docs` (development only)
 
-### Existing PostgreSQL volume password mismatch
+## Environment Variables
 
-`POSTGRES_PASSWORD` only initializes a new PostgreSQL data directory. Changing
-it in `.env` does not change the password stored in an existing
-`postgres_data` volume. Connect to PostgreSQL's always-present maintenance
-database (not `melostream`, which may not exist yet) and inspect the existing
-databases and roles:
+| Variable | Default | Description |
+|----------|---------|-------------|
+| APP_ENV | development | Environment: `development` or `production` |
+| LOG_LEVEL | INFO | Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+| RESOLVE_TIMEOUT_SECONDS | 25 | Maximum time to wait for yt-dlp extraction |
+| MAX_CONCURRENT_RESOLVES | 1 | Maximum concurrent extraction operations |
+| RATE_LIMIT_REQUESTS | 10 | Requests allowed per time window |
+| RATE_LIMIT_WINDOW_SECONDS | 600 | Time window in seconds (10 minutes) |
 
-```sh
-docker compose exec -u postgres postgres psql -d postgres
+## Rate Limiting
+
+### Implementation
+
+- **10 requests per 10 minutes** per client installation ID
+- Additional IP-based abuse limit as fallback
+- In-memory storage (resets on process restart)
+- Not shared across multiple server instances
+
+### Limitations
+
+- Rate limits reset when the server process restarts
+- Multiple server instances do not share rate limit state
+- Installation IDs can be spoofed by clients (not authenticated)
+- For production with multiple instances, consider Redis or a distributed cache
+
+### Headers
+
+- `X-Installation-ID`: Client-provided identifier (16-128 alphanumeric characters)
+- `Retry-After`: Seconds until quota resets (returned on 429 responses)
+
+## URL Validation & SSRF Protection
+
+### Validation Rules
+
+- Only HTTP and HTTPS schemes allowed
+- Credentials embedded in URLs are rejected
+- Localhost addresses are blocked
+- Private network IPs are blocked (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
+- Link-local addresses are blocked (169.254.0.0/16)
+- Cloud metadata endpoints are blocked (169.254.169.254, metadata.google.internal)
+
+### SSRF Assumptions
+
+- Checking the initial hostname does not guarantee complete SSRF protection
+- yt-dlp performs its own network requests and may follow redirects
+- DNS rebinding attacks are possible but mitigated by IP range blocking
+- For production, consider additional network-level restrictions
+
+### Supported Hosts
+
+The MVP uses a permissive approach for public websites. For stricter security, implement a supported-host whitelist in `app/utils/url_validation.py`.
+
+## yt-dlp Extraction Behavior
+
+### What is Extracted
+
+- Video title
+- Thumbnail URL
+- Duration in seconds
+- Available formats with direct download URLs
+- File size (if available from source)
+
+### Format Filtering
+
+- Only formats with both video and audio codecs are returned
+- Audio-only and video-only streams are excluded
+- Formats without direct download URLs are excluded
+- Duplicate formats (by format_id) are removed
+- Duplicate URLs are removed
+
+### Limitations
+
+- **No server-side downloads**: Media is not downloaded or stored
+- **No FFmpeg merging**: Separate audio/video streams are not combined
+- **Expiring URLs**: Some sources provide temporary URLs that expire
+- **Authorization**: Some formats require headers or session state not captured
+- **DRM**: DRM-protected content cannot be resolved
+- **CAPTCHA**: Videos requiring CAPTCHA cannot be resolved
+- **Age gates**: Age-restricted content returns 403 error
+
+### Timeout
+
+Default timeout is 25 seconds. Slow sources or large playlists may fail.
+
+## Unsupported Formats
+
+The following are not supported in this version:
+
+- DASH/HLS manifests (requires client-side parsing)
+- Separate audio/video streams (requires merging)
+- Live streams (not downloadable)
+- DRM-protected content
+- Paywalled content
+- Content requiring CAPTCHA
+
+## Render Deployment
+
+### Prerequisites
+
+- Render account (free tier)
+- Git repository with this code
+
+### Deployment Steps
+
+1. **Push code to Git repository**
+
+2. **Create new Web Service on Render:**
+   - Connect your Git repository
+   - Select the `server` directory as root (if using monorepo)
+   - Build command: Leave empty (uses Dockerfile)
+   - Start command: Leave empty (uses Dockerfile CMD)
+
+3. **Configure Environment Variables:**
+   ```
+   APP_ENV=production
+   LOG_LEVEL=INFO
+   RESOLVE_TIMEOUT_SECONDS=25
+   MAX_CONCURRENT_RESOLVES=1
+   RATE_LIMIT_REQUESTS=10
+   RATE_LIMIT_WINDOW_SECONDS=600
+   ```
+
+4. **Deploy:**
+   - Render will build using the Dockerfile
+   - The service will be available at `https://your-app.onrender.com`
+
+### Render-Specific Notes
+
+- Render automatically sets the `PORT` environment variable
+- The Dockerfile uses `--port 8000` but Render overrides this
+- Free tier has 512MB RAM limit - the server is optimized for this
+- Free tier has CPU limits - concurrent resolves are limited to 1
+- Free tier spins down after 15 minutes of inactivity
+
+### Dockerfile
+
+The Dockerfile:
+- Uses Python 3.12 slim base image
+- Installs FFmpeg for yt-dlp compatibility
+- Uses uv for fast, reproducible dependency installation
+- Excludes dev dependencies in production
+- Runs Uvicorn on 0.0.0.0 for Render's proxy
+
+## Testing
+
+### Run Tests
+
+```bash
+# Run all tests
+uv run pytest
+
+# Run with coverage
+uv run pytest --cov=app --cov-report=html
+
+# Run specific test file
+uv run pytest tests/test_health.py
+
+# Run with verbose output
+uv run pytest -v
 ```
 
-At the `psql` prompt, run:
+### Test Coverage
 
-```text
-\l
-\du
+- `test_health.py`: Health endpoint tests
+- `test_url_validation.py`: URL validation and SSRF protection tests
+- `test_rate_limit.py`: Rate limiting logic tests
+- `test_resolve.py`: Resolver service tests with mocked yt-dlp data
+
+### Linting
+
+```bash
+# Check code with ruff
+uv run ruff check .
+
+# Auto-fix issues
+uv run ruff check --fix .
 ```
 
-If the `melostream` role exists, reset its password with `\password melostream`
-and enter the new password twice. If it does not exist, create the role first:
+### Local Smoke Tests
 
-```sql
-CREATE ROLE melostream WITH LOGIN;
-\password melostream
+```bash
+# Start server
+uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
+
+# Test health endpoint
+curl http://127.0.0.1:8000/health
+
+# Test resolve endpoint (with real video URL)
+curl -X POST http://127.0.0.1:8000/v1/videos/resolve \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"}'
 ```
 
-Enter the new password twice when prompted. Avoid putting the password directly
-in the SQL command, where it can be saved in shell or database logs.
+## Troubleshooting
 
-If `melostream` is not listed in `\l`, create it after creating the role and
-confirming the existing database list does not contain the app's existing data:
+### Server won't start
 
-```sql
-CREATE DATABASE melostream OWNER melostream;
+- Check Python version: `python --version` (must be 3.12+)
+- Ensure uv is installed: `uv --version`
+- Check dependencies: `uv sync`
+- Verify .env file exists
+
+### Rate limit errors
+
+- Check `X-Installation-ID` header format (16-128 alphanumeric)
+- Wait for `Retry-After` seconds before retrying
+- Reset server to clear in-memory limits (development only)
+
+### yt-dlp extraction failures
+
+- Check if URL is publicly accessible
+- Verify video is not age-restricted or private
+- Try increasing `RESOLVE_TIMEOUT_SECONDS`
+- Check yt-dlp logs for specific error details
+
+### Render deployment issues
+
+- Check Render build logs for Docker build errors
+- Verify environment variables are set in Render dashboard
+- Ensure Dockerfile is in repository root
+- Check that PORT is not hardcoded in start command
+
+### Memory issues on Render
+
+- Reduce `MAX_CONCURRENT_RESOLVES` to 1 (default)
+- Reduce `RESOLVE_TIMEOUT_SECONDS` if timeouts are long
+- Monitor Render metrics for memory usage
+
+## Project Structure
+
+```
+server/
+├── app/
+│   ├── __init__.py
+│   ├── main.py                 # FastAPI application entry point
+│   ├── api/
+│   │   ├── __init__.py
+│   │   └── routes/
+│   │       ├── __init__.py
+│   │       ├── health.py       # Health check endpoint
+│   │       └── videos.py       # Video resolution endpoint
+│   ├── schema/
+│   │   ├── __init__.py
+│   │   └── video.py            # Pydantic models
+│   ├── services/
+│   │   ├── __init__.py
+│   │   └── resolver.py         # yt-dlp integration
+│   ├── core/
+│   │   ├── __init__.py
+│   │   ├── config.py           # Configuration settings
+│   │   └── rate_limit.py       # Rate limiting logic
+│   └── utils/
+│       ├── __init__.py
+│       └── url_validation.py   # URL validation & SSRF protection
+├── tests/
+│   ├── __init__.py
+│   ├── test_health.py
+│   ├── test_url_validation.py
+│   ├── test_rate_limit.py
+│   └── test_resolve.py
+├── .dockerignore
+├── .env.example
+├── .gitignore
+├── Dockerfile
+├── pyproject.toml
+├── uv.lock
+└── README.md
 ```
 
-Exit with `\q`. Set `POSTGRES_PASSWORD` in `.env` to the role password and
-ensure `DATABASE_URL` uses the same password. Then retry:
+## License
 
-```sh
-docker compose run --rm api uv run --no-sync alembic upgrade head
-```
-
-If an existing database has your app data under a different name, do not create
-a new empty database or remove the PostgreSQL volume. Instead, point
-`DATABASE_URL` at that existing database (and ensure its role has the password
-configured in `.env`). Do not remove the PostgreSQL volume to fix a password
-mismatch; removing it deletes the database contents.
-
-For production, use distinct strong secrets, set `AUTH_COOKIE_SECURE=true`,
-configure `CORS_ORIGINS` to explicit trusted web origins, and use HTTPS. If the
-web client is hosted cross-site from the API, set `AUTH_COOKIE_SAMESITE=none`
-along with `AUTH_COOKIE_SECURE=true`. Keep
-the Fernet key stable and back it up securely; changing or losing it makes
-existing encrypted social cookies unrecoverable. Do not commit `.env`.
-
-## Database
-
-`app/models.py` defines `User` and `UserSocialAccount`. The initial revision,
-`migrations/versions/20261007_01_create_user_accounts.py`, creates:
-
-- `users`: UUID primary key, unique email, bcrypt password hash, creation time.
-- `user_social_accounts`: UUID primary key, user foreign key with cascade
-  delete, platform constrained to `youtube`, `tiktok`, or `telegram`, encrypted
-  Netscape-format cookies, timestamps, and one account per platform per user.
-
-Apply migrations manually with `uv run alembic upgrade head`. To undo this
-initial revision (this drops both tables and their data), use
-`uv run alembic downgrade base`.
-
-## Authentication and social sessions
-
-- `POST /api/v1/auth/signup` accepts `{ "email": "...", "password": "..." }`.
-  Passwords must be at least 10 characters and are stored as one-way bcrypt
-  hashes.
-- `POST /api/v1/auth/token` accepts OAuth2 password-form fields `username`
-  (email) and `password`. It returns a short-lived OAuth2 bearer access token
-  and sets HttpOnly access/refresh cookies.
-- `POST /api/v1/auth/refresh` rotates the HttpOnly refresh cookie; the consumed
-  refresh token ID is invalidated in Redis. `POST /api/v1/auth/logout` revokes
-  it. `GET /api/v1/auth/me` returns the current account.
-- `PUT /api/v1/auth/social-accounts/{platform}` accepts (where `platform` is
-  `youtube`, `tiktok`, or `telegram`)
-  `{ "cookies": "<Netscape cookie-file text>" }`. `GET` lists configured
-  platforms without returning secrets; `DELETE` removes a saved session.
-
-The encryption key is read from `SOCIAL_COOKIE_ENCRYPTION_KEY`. Decrypted
-cookies are written with restrictive temporary-file permissions under `/tmp`
-only for a single extraction/download and are removed as soon as yt-dlp
-finishes using them.
-
-New social-cookie values use versioned AES-256-GCM encryption with a random
-nonce and authenticated ciphertext. Existing Fernet-encrypted values remain
-readable and are replaced with AES-256-GCM the next time that account's social
-session is updated. Keep the same `SOCIAL_COOKIE_ENCRYPTION_KEY` during the
-transition.
-
-## Download modes and routing
-
-authenticated server worker and stream, regardless of the toggle, so the
-authenticated user and detected URL platform.
-The app modes are **Default**, **YouTube**, **Telegram**, and **TikTok**.
-Default mode downloads supported external sites such as Facebook and Instagram
-without cookies. YouTube and TikTok use server-wide burner cookies; no per-user
-social-cookie record is needed for either platform. With Compose, the API reads
-the local `../www.youtube.com_cookies.txt` and `../www.tiktok.com_cookies.txt`
-files as read-only secrets. Keep these files outside source control and set
-their permissions to `600`. They are mounted into the API container and are
-never copied into the image. For hosted deployments that inject environment
-secrets instead, set `BURNER_YOUTUBE_COOKIES` and `BURNER_TIKTOK_COOKIES` to the
-Netscape-format file contents. Deployments that mount secret files can set
-`BURNER_YOUTUBE_COOKIES_FILE` and `BURNER_TIKTOK_COOKIES_FILE` to their mounted
-paths; a configured file path takes precedence over the environment value.
-Treat all cookie values and files as credentials.
-Telegram continues to use the user's encrypted cookie session.
-
-`POST /api/v1/info` accepts `{ "url": "...", "mode": "youtube|tiktok|telegram" }`
-for those modes. `POST /api/v1/download` accepts `url`, `format_id`, `resolution`,
-and `mode`, and responds with an MP4 `StreamingResponse`. The Expo client uses
-`GET /api/v1/download/direct` with `url`, `format_id`, and `mode` query values
-for a native resumable file transfer. Both routes use the same `asyncio.Semaphore(2)`
-and yt-dlp configuration. Each download and FFmpeg mux runs under a private
-`/tmp/ytdl_<UUID>/` directory. The response streams fixed 5 MiB chunks and
-removes that directory in a `finally` block when streaming completes or is
-interrupted.
-
-The semaphore is process-local: keep one API instance with one Uvicorn worker
-for a deployment-wide limit of two. Multiple Render instances or worker
-processes each get their own two-slot semaphore, so a global cap across scaled
-instances requires a distributed limiter. Existing Celery task status and
-cancellation routes remain for tasks queued before this direct-stream change;
-drain those tasks before retiring the worker.
-
-yt-dlp also uses one fragment request at a time and exponential waits between
-HTTP/fragment retries to reduce upstream 429 throttling. Files smaller than one
-chunk are handled by yt-dlp in one request; an upstream platform may still
-enforce its own rate limits.
-
-Queued download responses include a signed, short-lived cancellation token.
-Clients submit `{ "cancellationToken": "..." }` to
-`POST /api/v1/download/{task_id}/cancel`; the worker
-checks the shared Redis cancellation marker between yt-dlp progress callbacks
-and removes partial media and temporary files before returning a cancelled
-status. Generated stream files are retained for up to six hours to allow
-paused native transfers to resume. Native file transfers can be paused and
-resumed from the app history; the resume snapshot excludes authorization
-headers, which are refreshed when the user resumes.
-
-Provider OAuth is not used as a substitute for social session cookies. Google
-OAuth/YouTube Data API authorization and TikTok Login Kit authenticate access
-to provider APIs, but do not grant yt-dlp browser sessions. Telegram Login
-Widget authenticates an app user but does not create an MTProto session. These
-flows therefore do not enable the private-video download behavior this app
-offers. The app continues to use explicitly imported, encrypted session
-cookies; a provider OAuth integration should only be added alongside a real
-provider API feature and configured provider credentials.
-
-## Legacy configuration cleanup
-
-Remove `YTDLP_COOKIE_FILE` from deployment environment settings and stop using
-the old shared `app/storage/cookies.txt`. The burner cookie values replace
-per-user cookies for YouTube and TikTok downloads; Telegram continues to use
-the authenticated social-account endpoint. Remove any legacy global cookie
-file from the host after migrating any needed account sessions.
+[Add your license here]
