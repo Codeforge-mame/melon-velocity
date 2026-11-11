@@ -5,7 +5,17 @@
 [![Expo](https://img.shields.io/badge/Expo-000000?style=for-the-badge&logo=expo&logoColor=white)](https://expo.dev/)
 [![Docker](https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white)](https://www.docker.com/)
 
-A full-stack, cross-platform application featuring an **Expo (React Native)** client, a **FastAPI (Python)** REST API, and **Docker Compose** for containerized orchestration.
+A full-stack, cross-platform media downloader mobile application. Users paste a video URL into the **Expo (React Native)** client, which queries the **FastAPI (Python)** server to extract available video resolutions, separate streams (**Video + Audio**, **Video Only**, or **Audio Only**), and download the selected media directly from their device.
+
+---
+
+## 🚀 Key Features
+
+- 🔗 **URL Extraction:** Paste any supported media link to extract available stream formats instantly.
+- 🎬 **Format Filtering:** Separate options for **Video + Audio**, **Video Only**, and **Audio Only**.
+- 📐 **Resolution Picker:** Choose between available resolutions (e.g., 1080p, 720p, 480p, MP3/Audio).
+- ⚡ **Fast FastAPI Backend:** Python server handles stream extraction, format parsing, and media handling.
+- 📱 **Cross-Platform Mobile UI:** Built with Expo & React Native for seamless iOS and Android support.
 
 ---
 
@@ -129,3 +139,7 @@ npx expo start
 3. Commit your changes (`git commit -m 'Add some feature'`).
 4. Push to the branch (`git push origin feature/your-feature`).
 5. Open a Pull Request.
+
+----
+👨‍💻 Author
+Built by **Mohammed Ahmed** — Full-Stack AI & Mobile Engineer.
