@@ -1,10 +1,15 @@
-# Melon Velocity
+# 🚀 Melon Velocity
 
-A full-stack cross-platform application built with **Expo (React Native)** for the client, **FastAPI (Python)** for the backend API, and **Docker Compose** for containerized orchestration.
+[![FastAPI](https://img.shields.io/badge/FastAPI-005571?style=for-the-badge&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![React Native](https://img.shields.io/badge/React_Native-20232A?style=for-the-badge&logo=react&logoColor=61DAFB)](https://reactnative.dev/)
+[![Expo](https://img.shields.io/badge/Expo-000000?style=for-the-badge&logo=expo&logoColor=white)](https://expo.dev/)
+[![Docker](https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white)](https://www.docker.com/)
+
+A full-stack, cross-platform application featuring an **Expo (React Native)** client, a **FastAPI (Python)** REST API, and **Docker Compose** for containerized orchestration.
 
 ---
 
-## Project Structure
+## 🏗️ Project Structure
 
 ```text
 melon-velocity/
@@ -12,34 +17,33 @@ melon-velocity/
 ├── expo-client/       # Cross-platform mobile & web frontend (Expo / React Native)
 ├── server/            # Backend REST API (Python / FastAPI)
 └── .gitignore         # Git ignore rules
-```
 
 ---
 
-## Prerequisites
-
+📋 Prerequisites
 Ensure you have the following installed on your machine before getting started:
 
-- **Git**
-- **Docker** & **Docker Compose** (for containerized setup)
-- **Node.js** (v18+ recommended) & **npm** or **yarn** (for local frontend development)
-- **Python** (v3.10+ recommended) (for local backend development)
-- **Expo Go** app on your iOS/Android device (optional, for physical device testing)
+Git
 
+Docker & Docker Compose
+
+Node.js (v18+ recommended) & npm or yarn
+
+Python (v3.10+ recommended) & uv (Package manager)
+
+Expo Go app on your iOS/Android device (optional)
 ---
 
-## Getting Started
-
-### 1. Clone the Repository
-
-```bash
-git clone https://github.com/Codeforge-mame/melon-velocity.git
+🚀 Getting Started
+1. Clone the Repository
+```Bash
+git clone [https://github.com/Codeforge-mame/melon-velocity.git](https://github.com/Codeforge-mame/melon-velocity.git)
 cd melon-velocity
 ```
 
 ### 2. Environment Configuration
 
-Create environment files for both the server and client if required:
+Copy the example environment files for both the server and client:
 
 ```bash
 # Backend environment variables
@@ -56,20 +60,17 @@ cp expo-client/.env.example expo-client/.env
 
 ### Option A: Using Docker Compose (Recommended)
 
-Run the full stack using Docker Compose:
+#### 1. Start the backend server:
+  ```bash
+     cd server
+     docker compose up --build
+  ```
 
-```bash
-Terminal 1
----
-cd server
-docker compose up --build
-
----
-Terminal 2
----
-cd expo-client
-expo start
-```
+#### 2.Start the Expo client (in a new terminal window):
+   ```bash
+    cd expo-client
+    npx expo start
+   ```
 
 - **Backend API:** `http://localhost:8000`
 - **API Documentation (Swagger UI):** `http://localhost:8000/docs`
@@ -80,9 +81,14 @@ expo start
 
 ```bash
 cd server
+
+# Sync environment using uv
 uv sync
 
-source venv/bin/activate  # On Windows use: venv\Scripts\activate
+# Activate virtual environment
+source .venv/bin/activate  # On Windows use: .venv\Scripts\activate
+
+# Launch FastAPI server
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
@@ -92,10 +98,15 @@ Open a new terminal window:
 
 ```bash
 cd expo-client
+
+# Install frontend dependencies
 npm install
+
+# Start Expo dev server
 npx expo start
 ```
 
+**Controls:**
 - Press **`w`** to open in a web browser.
 - Press **`a`** to open on an Android emulator.
 - Press **`i`** to open on an iOS simulator.
@@ -105,9 +116,9 @@ npx expo start
 
 ## Tech Stack
 
-- **Frontend:** React Native, Expo
-- **Backend:** Python, FastAPI
-- **DevOps & Tooling:** Docker, Docker Compose, Dev Containers
+- **Frontend:** React Native, Expo, TypeScript
+- **Backend:** Python, FastAPI, UV
+- **DevOps & Tooling:** Docker, Docker Compose
 
 ---
 
