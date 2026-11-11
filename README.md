@@ -59,7 +59,16 @@ cp expo-client/.env.example expo-client/.env
 Run the full stack using Docker Compose:
 
 ```bash
+Terminal 1
+---
+cd server
 docker compose up --build
+
+---
+Terminal 2
+---
+cd expo-client
+expo start
 ```
 
 - **Backend API:** `http://localhost:8000`
@@ -71,10 +80,10 @@ docker compose up --build
 
 ```bash
 cd server
-python -m venv venv
+uv sync
+
 source venv/bin/activate  # On Windows use: venv\Scripts\activate
-pip install -r requirements.txt
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 #### 2. Start the Expo Client
