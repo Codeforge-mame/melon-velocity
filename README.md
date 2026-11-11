@@ -17,7 +17,7 @@ melon-velocity/
 ├── expo-client/       # Cross-platform mobile & web frontend (Expo / React Native)
 ├── server/            # Backend REST API (Python / FastAPI)
 └── .gitignore         # Git ignore rules
-
+```
 ---
 
 📋 Prerequisites
