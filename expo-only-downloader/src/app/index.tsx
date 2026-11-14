@@ -24,7 +24,7 @@ export default function App() {
 
       <View className="flex-1">
         {activeTab === 'download' ? (
-          <DownloaderScreen onDownloadStarted={() => setActiveTab('history')} />
+          <DownloaderScreen onOpenHistory={() => setActiveTab('history')} />
         ) : (
           <HistoryScreen />
         )}

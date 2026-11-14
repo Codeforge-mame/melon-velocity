@@ -1,17 +1,14 @@
 import { DownloadMode } from '../db/database';
 
-// Point this to your self-hosted Cobalt instance URL (no trailing slash)
 export const COBALT_INSTANCE_URL = 'https://cobalt-production-58fa76fe.up.railway.app';
-
-// Optional: If you enabled API key authentication on your Cobalt instance
-const COBALT_API_KEY = process.env.API_KEY;
+const COBALT_API_KEY = process.env.API_KEY; // Match your Railway API_KEY
 
 export type VideoQuality = '2160' | '1440' | '1080' | '720' | '480' | '360' | 'max';
 
 export interface ResolveRequest {
   url: string;
-  mode: DownloadMode;       // 'auto' (Audio+Video) | 'mute' (Video Only) | 'audio' (Audio Only)
-  quality: VideoQuality;    // '1080' | '720' | '480' | '360' | etc.
+  mode: DownloadMode;
+  quality: VideoQuality;
 }
 
 export interface ResolvedMedia {
@@ -35,17 +32,16 @@ export async function resolveMediaUrl({
     headers['Authorization'] = `Api-Key ${COBALT_API_KEY}`;
   }
 
-  // Build payload matching Cobalt v10+ specification
   const payload: Record<string, unknown> = {
     url: url.trim(),
     downloadMode: mode,
     filenameStyle: 'pretty',
+    alwaysProxy: false, // Allow direct CDN downloads whenever supported for max speed
   };
 
-  // Apply resolution filter when downloading video ('auto' or 'mute')
   if (mode !== 'audio') {
     payload.videoQuality = quality;
-    payload.youtubeVideoCodec = 'h264'; // Best compatibility for iOS/Android native gallery & players
+    payload.youtubeVideoCodec = 'h264';
   } else {
     payload.audioFormat = 'mp3';
     payload.audioBitrate = '128';
@@ -61,10 +57,10 @@ export async function resolveMediaUrl({
 
   if (!response.ok || data.status === 'error') {
     const errorCode = data?.error?.code || 'unknown_error';
-    throw new Error(formatCobaltError(errorCode));
+    const service = data?.error?.context?.service || '';
+    throw new Error(formatCobaltError(errorCode, service));
   }
 
-  // Case 1: Standard single stream ('tunnel' or 'redirect')
   if (data.status === 'tunnel' || data.status === 'redirect') {
     const rawFilename: string = data.filename || generateFallbackFilename(mode);
     return {
@@ -75,9 +71,8 @@ export async function resolveMediaUrl({
     };
   }
 
-  // Case 2: Multi-item post (e.g. Instagram carousel or slideshow)
   if (data.status === 'picker' && Array.isArray(data.picker) && data.picker.length > 0) {
-    const firstItem = data.picker[0];
+    const firstItem = data.picker;
     const fallbackName = generateFallbackFilename(mode);
     return {
       streamUrl: firstItem.url,
@@ -90,10 +85,7 @@ export async function resolveMediaUrl({
   throw new Error(`Unsupported Cobalt response status: ${data.status}`);
 }
 
-// --- Helper Functions ---
-
 function sanitizeFilename(name: string): string {
-  // Remove characters that break Android/iOS file paths
   return name.replace(/[<>:"/\\|?*\x00-\x1F]/g, '_').trim();
 }
 
@@ -106,13 +98,15 @@ function generateFallbackFilename(mode: DownloadMode): string {
   return `rooster_${Date.now()}.${ext}`;
 }
 
-function formatCobaltError(code: string): string {
+function formatCobaltError(code: string, service: string): string {
+  const site = service ? ` (${service})` : '';
   const errorMap: Record<string, string> = {
-    'error.api.link.invalid': 'The URL you entered is invalid or not supported.',
-    'error.api.link.unsupported': 'This website is not supported by your Cobalt instance.',
-    'error.api.fetch.empty': 'No downloadable media was found at that link.',
-    'error.api.fetch.rate': 'Rate limit reached on Cobalt. Try again in a moment.',
-    'error.api.youtube.login': 'This video is age-restricted or requires sign-in.',
+    'error.api.link.invalid': 'Invalid URL format. Check the link and try again.',
+    'error.api.link.unsupported': `This website${site} is not supported by Cobalt.`,
+    'error.api.fetch.empty': `No downloadable media found${site}. Post may be private.`,
+    'error.api.fetch.rate': `Rate limit hit${site}. Wait a moment or add a proxy on Railway.`,
+    'error.api.fetch.critical': `Server blocked by ${service || 'platform'}. Datacenter IP or cookies needed.`,
+    'error.api.youtube.login': 'YouTube blocked this datacenter IP (bot check). Add a proxy or cookies on Railway.',
   };
-  return errorMap[code] || `Cobalt error (${code})`;
+  return errorMap[code] || `Cobalt error${site}: ${code}`;
 }

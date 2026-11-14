@@ -12,6 +12,7 @@ import * as Clipboard from 'expo-clipboard';
 import { DownloadMode } from '../db/database';
 import { VideoQuality } from '../services/cobalt';
 import { startNewDownload } from '../services/downloadManager';
+import { useDownloads } from '../hooks/useDownloads';
 
 const MODES: { label: string; value: DownloadMode }[] = [
   { label: 'Audio + Video', value: 'auto' },
@@ -27,14 +28,20 @@ const RESOLUTIONS: { label: string; value: VideoQuality }[] = [
 ];
 
 interface Props {
-  onDownloadStarted: () => void;
+  onOpenHistory: () => void;
 }
 
-export function DownloaderScreen({ onDownloadStarted }: Props) {
+export function DownloaderScreen({ onOpenHistory }: Props) {
   const [url, setUrl] = useState('');
   const [mode, setMode] = useState<DownloadMode>('auto');
   const [quality, setQuality] = useState<VideoQuality>('1080');
   const [submitting, setSubmitting] = useState(false);
+  const [queuedNotice, setQueuedNotice] = useState<string | null>(null);
+
+  const { downloads } = useDownloads();
+  const activeDownloads = downloads.filter(
+    (d) => d.status === 'downloading' || d.status === 'queued'
+  );
 
   const handlePaste = async () => {
     const text = await Clipboard.getStringAsync();
@@ -49,11 +56,10 @@ export function DownloaderScreen({ onDownloadStarted }: Props) {
 
     setSubmitting(true);
     try {
-      startNewDownload(url.trim(), mode, quality).catch(() => {
-        // Errors are recorded in SQLite & surfaced in the History tab
-      });
+      startNewDownload(url.trim(), mode, quality).catch(() => {});
       setUrl('');
-      onDownloadStarted();
+      setQueuedNotice('Added to background queue! Paste another link anytime.');
+      setTimeout(() => setQueuedNotice(null), 3500);
     } finally {
       setSubmitting(false);
     }
@@ -62,14 +68,39 @@ export function DownloaderScreen({ onDownloadStarted }: Props) {
   return (
     <ScrollView className="flex-1 bg-zinc-950 px-5 pt-6">
       {/* Header */}
-      <View className="mb-6">
+      <View className="mb-5">
         <Text className="text-3xl font-extrabold text-white tracking-tight">
           Rooster
         </Text>
         <Text className="text-zinc-400 text-sm mt-1">
-          Paste a link, pick your format, and download in the background.
+          Paste links to queue multiple background downloads.
         </Text>
       </View>
+
+      {/* Live Background Queue Status Banner */}
+      {activeDownloads.length > 0 && (
+        <TouchableOpacity
+          onPress={onOpenHistory}
+          className="bg-zinc-900 border border-red-500/40 rounded-2xl p-3.5 mb-5 flex-row items-center justify-between"
+        >
+          <View className="flex-row items-center gap-2.5 flex-1">
+            <ActivityIndicator size="small" color="#ef4444" />
+            <Text numberOfLines={1} className="text-zinc-200 text-xs font-bold flex-1">
+              {activeDownloads.length === 1
+                ? `Downloading: ${activeDownloads.title}`
+                : `${activeDownloads.length} videos downloading in background`}
+            </Text>
+          </View>
+          <Text className="text-red-400 text-xs font-extrabold ml-2">View →</Text>
+        </TouchableOpacity>
+      )}
+
+      {/* Confirmation Toast */}
+      {queuedNotice && (
+        <View className="bg-emerald-950/80 border border-emerald-700/50 rounded-xl px-4 py-2.5 mb-4">
+          <Text className="text-emerald-300 text-xs font-semibold">{queuedNotice}</Text>
+        </View>
+      )}
 
       {/* URL Input Card */}
       <View className="bg-zinc-900 border border-zinc-800 rounded-2xl p-4 mb-6">
@@ -104,7 +135,7 @@ export function DownloaderScreen({ onDownloadStarted }: Props) {
         </View>
       </View>
 
-      {/* Stream Type Filter (Audio+Video / Video Only / Audio Only) */}
+      {/* Format Mode Filter */}
       <View className="mb-6">
         <Text className="text-zinc-300 text-xs font-semibold uppercase tracking-wider mb-2.5">
           Format Mode
@@ -117,9 +148,7 @@ export function DownloaderScreen({ onDownloadStarted }: Props) {
                 key={item.value}
                 onPress={() => setMode(item.value)}
                 className={`flex-1 py-3 px-2 rounded-xl border items-center ${
-                  active
-                    ? 'bg-red-600 border-red-500'
-                    : 'bg-zinc-900 border-zinc-800'
+                  active ? 'bg-red-600 border-red-500' : 'bg-zinc-900 border-zinc-800'
                 }`}
               >
                 <Text
@@ -182,7 +211,7 @@ export function DownloaderScreen({ onDownloadStarted }: Props) {
           <ActivityIndicator color="#ffffff" />
         ) : (
           <Text className="text-white font-extrabold text-base tracking-wide">
-            Start Background Download
+            Download in Background
           </Text>
         )}
       </TouchableOpacity>

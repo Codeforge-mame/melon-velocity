@@ -1,7 +1,7 @@
 import * as SQLite from 'expo-sqlite';
 
 export type DownloadStatus = 'queued' | 'downloading' | 'paused' | 'completed' | 'failed';
-export type DownloadMode = 'auto' | 'audio' | 'mute'; // auto = Audio+Video, mute = Video Only
+export type DownloadMode = 'auto' | 'audio' | 'mute';
 
 export interface DownloadItem {
   id: string;
@@ -15,7 +15,8 @@ export interface DownloadItem {
   progress: number;
   resume_data: string | null;
   local_uri: string | null;
-  saved_to_gallery: number; // 0 or 1
+  thumbnail_uri: string | null;
+  saved_to_gallery: number;
   error_message: string | null;
   created_at: number;
 }
@@ -45,21 +46,27 @@ async function initDB(db: SQLite.SQLiteDatabase) {
       progress REAL DEFAULT 0,
       resume_data TEXT,
       local_uri TEXT,
+      thumbnail_uri TEXT,
       saved_to_gallery INTEGER DEFAULT 0,
       error_message TEXT,
       created_at INTEGER NOT NULL
     );
   `);
+
+  try {
+    await db.execAsync(`ALTER TABLE downloads ADD COLUMN thumbnail_uri TEXT;`);
+  } catch {
+    // Column already exists
+  }
 }
 
-// Create a new download record
 export async function insertDownload(item: Omit<DownloadItem, 'created_at'>): Promise<void> {
   const db = await getDB();
   await db.runAsync(
     `INSERT INTO downloads (
       id, source_url, resolved_url, title, filename, mode, quality, 
-      status, progress, resume_data, local_uri, saved_to_gallery, error_message, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      status, progress, resume_data, local_uri, thumbnail_uri, saved_to_gallery, error_message, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       item.id,
       item.source_url,
@@ -72,6 +79,7 @@ export async function insertDownload(item: Omit<DownloadItem, 'created_at'>): Pr
       item.progress,
       item.resume_data,
       item.local_uri,
+      item.thumbnail_uri,
       item.saved_to_gallery,
       item.error_message,
       Date.now(),
@@ -79,7 +87,6 @@ export async function insertDownload(item: Omit<DownloadItem, 'created_at'>): Pr
   );
 }
 
-// Fetch all downloads for the History & Active Queue screens
 export async function getAllDownloads(): Promise<DownloadItem[]> {
   const db = await getDB();
   return await db.getAllAsync<DownloadItem>(
@@ -87,13 +94,19 @@ export async function getAllDownloads(): Promise<DownloadItem[]> {
   );
 }
 
-// Update status, progress, or resume snapshot
 export async function updateDownloadState(
   id: string,
   updates: Partial<
     Pick<
       DownloadItem,
-      'status' | 'progress' | 'resume_data' | 'local_uri' | 'resolved_url' | 'saved_to_gallery' | 'error_message'
+      | 'status'
+      | 'progress'
+      | 'resume_data'
+      | 'local_uri'
+      | 'thumbnail_uri'
+      | 'resolved_url'
+      | 'saved_to_gallery'
+      | 'error_message'
     >
   >
 ): Promise<void> {
@@ -107,7 +120,6 @@ export async function updateDownloadState(
   await db.runAsync(`UPDATE downloads SET ${setClause} WHERE id = ?`, [...values, id]);
 }
 
-// Delete a download record
 export async function deleteDownloadRecord(id: string): Promise<void> {
   const db = await getDB();
   await db.runAsync('DELETE FROM downloads WHERE id = ?', [id]);

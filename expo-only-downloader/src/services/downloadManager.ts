@@ -1,6 +1,8 @@
 import * as FileSystem from 'expo-file-system/legacy';
 import * as MediaLibrary from 'expo-media-library';
 import * as Notifications from 'expo-notifications';
+import * as VideoThumbnails from 'expo-video-thumbnails';
+import * as Sharing from 'expo-sharing';
 import * as Crypto from 'expo-crypto';
 import { Platform } from 'react-native';
 
@@ -14,7 +16,6 @@ import {
 } from '../db/database';
 import { resolveMediaUrl, VideoQuality } from './cobalt';
 
-// Configure how notifications behave when the app is open
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
     shouldShowAlert: true,
@@ -25,13 +26,9 @@ Notifications.setNotificationHandler({
   }),
 });
 
-// Keep active FileSystem.DownloadResumable instances in memory for pause/resume
 const activeTasks = new Map<string, FileSystem.DownloadResumable>();
-
-// Throttle SQLite writes during fast progress ticks (max once every 600ms per download)
 const lastDbSync = new Map<string, number>();
 
-// Optional UI listener so your screens re-render smoothly on state changes
 type Listener = () => void;
 const listeners = new Set<Listener>();
 
@@ -44,7 +41,6 @@ function notifyUI() {
   listeners.forEach((fn) => fn());
 }
 
-// --- 1. Request Notification Permissions & Setup Android Channel ---
 export async function ensureNotificationPermissions(): Promise<boolean> {
   if (Platform.OS === 'android') {
     await Notifications.setNotificationChannelAsync('rooster-downloads', {
@@ -67,26 +63,33 @@ async function sendDownloadNotification(title: string, body: string, id: string)
 
   await Notifications.scheduleNotificationAsync({
     identifier: `dl-${id}`,
-    content: {
-      title,
-      body,
-      sound: false,
-    },
-    trigger: null, // Deliver immediately
+    content: { title, body, sound: false },
+    trigger: null,
   });
 }
 
-// --- 2. Start a Brand New Download ---
+async function generateAndSaveThumbnail(id: string, videoUri: string): Promise<string | null> {
+  try {
+    const { uri: tempThumb } = await VideoThumbnails.getThumbnailAsync(videoUri, {
+      time: 1000,
+      quality: 0.7,
+    });
+    const destThumb = `${FileSystem.documentDirectory}thumb_${id}.jpg`;
+    await FileSystem.copyAsync({ from: tempThumb, to: destThumb });
+    return destThumb;
+  } catch {
+    return null;
+  }
+}
+
 export async function startNewDownload(
   sourceUrl: string,
   mode: DownloadMode,
   quality: VideoQuality
 ): Promise<string> {
   await ensureNotificationPermissions();
-
   const id = Crypto.randomUUID();
 
-  // Create initial 'queued' record immediately so UI shows instant feedback
   await insertDownload({
     id,
     source_url: sourceUrl,
@@ -99,16 +102,15 @@ export async function startNewDownload(
     progress: 0,
     resume_data: null,
     local_uri: null,
+    thumbnail_uri: null,
     saved_to_gallery: 0,
     error_message: null,
   });
   notifyUI();
 
   try {
-    // Resolve direct stream via your Railway Cobalt instance
     const resolved = await resolveMediaUrl({ url: sourceUrl, mode, quality });
 
-    // Update record with real title, filename, and resolved stream URL
     const db = await import('../db/database').then((m) => m.getDB());
     await db.runAsync(
       'UPDATE downloads SET title = ?, filename = ?, resolved_url = ?, status = ? WHERE id = ?',
@@ -117,28 +119,23 @@ export async function startNewDownload(
     notifyUI();
 
     await sendDownloadNotification('Downloading started', resolved.title, id);
-
-    // Begin actual file download
-    await executeDownloadTask(id, resolved.streamUrl, resolved.filename, resolved.title);
+    await executeDownloadTask(id, resolved.streamUrl, resolved.filename, resolved.title, mode);
     return id;
   } catch (err: any) {
     const message = err?.message || 'Failed to resolve media link.';
-    await updateDownloadState(id, {
-      status: 'failed',
-      error_message: message,
-    });
+    await updateDownloadState(id, { status: 'failed', error_message: message });
     notifyUI();
     await sendDownloadNotification('Download failed', message, id);
     throw err;
   }
 }
 
-// --- Core Download Executor ---
 async function executeDownloadTask(
   id: string,
   streamUrl: string,
   filename: string,
   title: string,
+  mode: DownloadMode,
   savedResumeData?: string | null
 ) {
   const fileUri = `${FileSystem.documentDirectory}${filename}`;
@@ -150,9 +147,10 @@ async function executeDownloadTask(
         ? Math.min(totalBytesWritten / totalBytesExpectedToWrite, 1)
         : 0;
 
+    // 800ms throttle keeps JS bridge fast during concurrent downloads
     const now = Date.now();
     const last = lastDbSync.get(id) || 0;
-    if (now - last > 600 || ratio >= 1) {
+    if (now - last > 800 || ratio >= 1) {
       lastDbSync.set(id, now);
       await updateDownloadState(id, { progress: ratio });
       notifyUI();
@@ -160,13 +158,7 @@ async function executeDownloadTask(
   };
 
   const downloadResumable = savedResumeData
-    ? new FileSystem.DownloadResumable(
-        streamUrl,
-        fileUri,
-        {},
-        onProgress,
-        savedResumeData
-      )
+    ? new FileSystem.DownloadResumable(streamUrl, fileUri, {}, onProgress, savedResumeData)
     : FileSystem.createDownloadResumable(streamUrl, fileUri, {}, onProgress);
 
   activeTasks.set(id, downloadResumable);
@@ -179,17 +171,19 @@ async function executeDownloadTask(
     activeTasks.delete(id);
     lastDbSync.delete(id);
 
-    // If result is undefined, the user paused the download intentionally
     if (!result) return;
-
     if (result.status >= 400) {
       throw new Error(`Server returned HTTP ${result.status}`);
     }
+
+    const thumbnailUri =
+      mode !== 'audio' ? await generateAndSaveThumbnail(id, result.uri) : null;
 
     await updateDownloadState(id, {
       status: 'completed',
       progress: 1,
       local_uri: result.uri,
+      thumbnail_uri: thumbnailUri,
       resume_data: null,
       error_message: null,
     });
@@ -200,26 +194,20 @@ async function executeDownloadTask(
     activeTasks.delete(id);
     lastDbSync.delete(id);
 
-    // Ignore abort errors caused when user taps Pause
     const currentItems = await getAllDownloads();
     const current = currentItems.find((item) => item.id === id);
     if (current?.status === 'paused') return;
 
     const message = err?.message || 'Download interrupted.';
-    await updateDownloadState(id, {
-      status: 'failed',
-      error_message: message,
-    });
+    await updateDownloadState(id, { status: 'failed', error_message: message });
     notifyUI();
 
     await sendDownloadNotification('Download failed', `${title}: ${message}`, id);
   }
 }
 
-// --- 3. Pause Download ---
 export async function pauseDownload(id: string): Promise<void> {
   const task = activeTasks.get(id);
-
   await updateDownloadState(id, { status: 'paused' });
   notifyUI();
 
@@ -233,22 +221,17 @@ export async function pauseDownload(id: string): Promise<void> {
       });
       notifyUI();
     } catch {
-      // Even if pauseAsync throws on certain streams, state is marked paused
       activeTasks.delete(id);
     }
   }
 }
 
-// --- 4. Resume Download ---
 export async function resumeDownload(item: DownloadItem): Promise<void> {
   if (!item.resolved_url) {
     return retryDownload(item);
   }
 
-  await updateDownloadState(item.id, {
-    status: 'downloading',
-    error_message: null,
-  });
+  await updateDownloadState(item.id, { status: 'downloading', error_message: null });
   notifyUI();
 
   await executeDownloadTask(
@@ -256,11 +239,11 @@ export async function resumeDownload(item: DownloadItem): Promise<void> {
     item.resolved_url,
     item.filename,
     item.title,
+    item.mode,
     item.resume_data
   );
 }
 
-// --- 5. Retry Download (Auto-refreshes expired Cobalt link!) ---
 export async function retryDownload(item: DownloadItem): Promise<void> {
   await updateDownloadState(item.id, {
     status: 'queued',
@@ -271,7 +254,6 @@ export async function retryDownload(item: DownloadItem): Promise<void> {
   notifyUI();
 
   try {
-    // Re-query Cobalt so expired tunnel URLs never block a retry
     const resolved = await resolveMediaUrl({
       url: item.source_url,
       mode: item.mode,
@@ -284,7 +266,13 @@ export async function retryDownload(item: DownloadItem): Promise<void> {
     });
     notifyUI();
 
-    await executeDownloadTask(item.id, resolved.streamUrl, item.filename, item.title);
+    await executeDownloadTask(
+      item.id,
+      resolved.streamUrl,
+      item.filename,
+      item.title,
+      item.mode
+    );
   } catch (err: any) {
     await updateDownloadState(item.id, {
       status: 'failed',
@@ -294,24 +282,40 @@ export async function retryDownload(item: DownloadItem): Promise<void> {
   }
 }
 
-// --- 6. Save Downloaded File to Device Gallery ---
 export async function saveItemToGallery(item: DownloadItem): Promise<void> {
   if (!item.local_uri) {
     throw new Error('File not found on device.');
   }
 
-  const { status } = await MediaLibrary.requestPermissionsAsync();
+  const fileInfo = await FileSystem.getInfoAsync(item.local_uri);
+  if (!fileInfo.exists) {
+    throw new Error('Downloaded file no longer exists on disk.');
+  }
+
+  const { status } = await MediaLibrary.requestPermissionsAsync(true);
   if (status !== 'granted') {
     throw new Error('Gallery permission is required to save media.');
   }
 
-  await MediaLibrary.saveToLibraryAsync(item.local_uri);
+  await MediaLibrary.createAssetAsync(item.local_uri);
 
   await updateDownloadState(item.id, { saved_to_gallery: 1 });
   notifyUI();
 }
 
-// --- 7. Delete Download & Clean Local File ---
+export async function shareDownloadedItem(item: DownloadItem): Promise<void> {
+  if (!item.local_uri) {
+    throw new Error('File not found on device.');
+  }
+  const available = await Sharing.isAvailableAsync();
+  if (!available) {
+    throw new Error('Sharing is not available on this device.');
+  }
+  await Sharing.shareAsync(item.local_uri, {
+    dialogTitle: item.title,
+  });
+}
+
 export async function removeDownload(item: DownloadItem): Promise<void> {
   const task = activeTasks.get(item.id);
   if (task) {
@@ -324,6 +328,12 @@ export async function removeDownload(item: DownloadItem): Promise<void> {
   if (item.local_uri) {
     try {
       await FileSystem.deleteAsync(item.local_uri, { idempotent: true });
+    } catch {}
+  }
+
+  if (item.thumbnail_uri) {
+    try {
+      await FileSystem.deleteAsync(item.thumbnail_uri, { idempotent: true });
     } catch {}
   }
 
