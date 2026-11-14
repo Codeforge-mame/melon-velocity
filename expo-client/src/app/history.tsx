@@ -1,5 +1,14 @@
 import { useRouter } from "expo-router";
-import { Alert, FlatList, Pressable, Text, View } from "react-native";
+import { useState } from "react";
+import {
+  Alert,
+  FlatList,
+  Modal,
+  Pressable,
+  Share,
+  Text,
+  View,
+} from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import {
@@ -7,6 +16,7 @@ import {
   pauseDownload,
   removeDownload,
   resumeDownload,
+  saveDownloadToGallery,
 } from "@/features/downloads/downloadManager";
 import type { DownloadRecord } from "@/features/downloads/types";
 import { useDownloads } from "@/features/downloads/useDownloads";
@@ -35,11 +45,62 @@ export default function HistoryScreen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
   const downloads = useDownloads();
+  const [menuFor, setMenuFor] = useState<DownloadRecord | null>(null);
+
+  const closeMenu = () => setMenuFor(null);
+
+  const onSaveToGallery = async (item: DownloadRecord) => {
+    closeMenu();
+    const ok = await saveDownloadToGallery(item.id);
+    Alert.alert(
+      ok ? "Saved" : "Could not save",
+      ok
+        ? "The file was saved to your gallery."
+        : "Media library permission was denied or the file is missing.",
+    );
+  };
+
+  const onShare = async (item: DownloadRecord) => {
+    closeMenu();
+    const link = item.sourceUrl ?? item.url;
+    try {
+      await Share.share({
+        title: item.title,
+        message: `${item.title}\n${link}`,
+        url: link,
+      });
+    } catch {
+      Alert.alert("Share failed", "Could not open the share sheet.");
+    }
+  };
+
+  const onPlay = (item: DownloadRecord) => {
+    closeMenu();
+    const uri = item.localUri ?? item.url;
+    if (!uri) {
+      Alert.alert("Cannot play", "No playable file is available.");
+      return;
+    }
+    router.push({ pathname: "/player", params: { uri, title: item.title } });
+  };
+
+  const onRemove = (item: DownloadRecord) => {
+    closeMenu();
+    Alert.alert("Remove", "Remove this entry from the list?", [
+      { text: "Cancel", style: "cancel" },
+      {
+        text: "Remove",
+        style: "destructive",
+        onPress: () => void removeDownload(item.id),
+      },
+    ]);
+  };
 
   const renderItem = ({ item }: { item: DownloadRecord }) => {
     const ratio = progress(item);
     const canPause = item.status === "downloading" || item.status === "queued";
     const canResume = item.status === "paused" || item.status === "error";
+    const completed = item.status === "completed";
 
     return (
       <View className="mb-3 rounded-2xl border border-slate-800/60 bg-slate-900/50 p-4">
@@ -55,6 +116,15 @@ export default function HistoryScreen() {
           >
             {item.status}
           </Text>
+          {completed && (
+            <Pressable
+              onPress={() => setMenuFor(item)}
+              hitSlop={10}
+              className="ml-3 rounded-lg border border-slate-700/60 bg-slate-800/60 px-2 py-1"
+            >
+              <Text className="text-base font-bold text-white">⋮</Text>
+            </Pressable>
+          )}
         </View>
 
         <Text className="mt-1 text-xs text-slate-400">
@@ -79,34 +149,25 @@ export default function HistoryScreen() {
           <Text className="mt-2 text-xs text-red-300">{item.error}</Text>
         ) : null}
 
-        <View className="mt-3 flex-row items-center gap-4">
-          {canPause && (
-            <Pressable onPress={() => void pauseDownload(item.id)}>
-              <Text className="text-xs font-semibold text-amber-300">Pause</Text>
+        {!completed && (
+          <View className="mt-3 flex-row items-center gap-4">
+            {canPause && (
+              <Pressable onPress={() => void pauseDownload(item.id)}>
+                <Text className="text-xs font-semibold text-amber-300">Pause</Text>
+              </Pressable>
+            )}
+            {canResume && (
+              <Pressable onPress={() => void resumeDownload(item.id)}>
+                <Text className="text-xs font-semibold text-indigo-300">
+                  {item.resumeData ? "Resume" : "Restart"}
+                </Text>
+              </Pressable>
+            )}
+            <Pressable onPress={() => onRemove(item)}>
+              <Text className="text-xs font-semibold text-slate-400">Remove</Text>
             </Pressable>
-          )}
-          {canResume && (
-            <Pressable onPress={() => void resumeDownload(item.id)}>
-              <Text className="text-xs font-semibold text-indigo-300">
-                {item.resumeData ? "Resume" : "Restart"}
-              </Text>
-            </Pressable>
-          )}
-          <Pressable
-            onPress={() =>
-              Alert.alert("Remove", "Remove this entry from the list?", [
-                { text: "Cancel", style: "cancel" },
-                {
-                  text: "Remove",
-                  style: "destructive",
-                  onPress: () => void removeDownload(item.id),
-                },
-              ])
-            }
-          >
-            <Text className="text-xs font-semibold text-slate-400">Remove</Text>
-          </Pressable>
-        </View>
+          </View>
+        )}
       </View>
     );
   };
@@ -149,6 +210,74 @@ export default function HistoryScreen() {
           </View>
         }
       />
+
+      <Modal
+        visible={menuFor !== null}
+        transparent
+        animationType="fade"
+        onRequestClose={closeMenu}
+      >
+        <Pressable
+          className="flex-1 justify-end bg-black/60"
+          onPress={closeMenu}
+        >
+          <Pressable
+            className="rounded-t-3xl border-t border-slate-800 bg-slate-900 p-6"
+            style={{ paddingBottom: insets.bottom + 20 }}
+            onPress={() => {}}
+          >
+            <Text
+              numberOfLines={1}
+              className="mb-4 text-base font-bold text-white"
+            >
+              {menuFor?.title}
+            </Text>
+
+            <MenuButton
+              label="Save to Gallery"
+              onPress={() => menuFor && void onSaveToGallery(menuFor)}
+            />
+            <MenuButton
+              label="Share link"
+              onPress={() => menuFor && void onShare(menuFor)}
+            />
+            <MenuButton
+              label="Play"
+              onPress={() => menuFor && onPlay(menuFor)}
+            />
+            <MenuButton
+              label="Remove"
+              destructive
+              onPress={() => menuFor && onRemove(menuFor)}
+            />
+          </Pressable>
+        </Pressable>
+      </Modal>
     </View>
+  );
+}
+
+function MenuButton({
+  label,
+  onPress,
+  destructive,
+}: {
+  label: string;
+  onPress: () => void;
+  destructive?: boolean;
+}) {
+  return (
+    <Pressable
+      onPress={onPress}
+      className="mb-2 rounded-2xl border border-slate-800 bg-slate-950/60 p-4 active:opacity-80"
+    >
+      <Text
+        className={`text-base font-semibold ${
+          destructive ? "text-red-400" : "text-white"
+        }`}
+      >
+        {label}
+      </Text>
+    </Pressable>
   );
 }

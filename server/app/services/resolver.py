@@ -151,10 +151,11 @@ class ResolverService:
         min_filesize: int | None = None,
         max_filesize: int | None = None,
         category: str | None = None,
+        skip_cache: bool = False,
     ) -> ResolveResponse:
         """Internal resolution logic without queue."""
-        # Check cache first
-        cached = await cache_service.get(url)
+        # Check cache first (unless caller requested a fresh extraction)
+        cached = None if skip_cache else await cache_service.get(url)
         if cached:
             # Apply filters to cached result
             filtered_formats = self._filter_formats(
@@ -235,17 +236,19 @@ class ResolverService:
                     seen_urls.add(download_url)
 
                     # Check if authorization is required
-                    requires_auth = fmt.get("http_headers", {}).get("Authorization") is not None
+                    http_headers = fmt.get("http_headers", {}) or {}
+                    requires_auth = http_headers.get("Authorization") is not None
 
                     format_obj = VideoFormat(
                         formatId=fmt.get("format_id", "unknown"),
                         label=self._generate_format_label(fmt),
                         container=fmt.get("ext", "mp4"),
-                        fileSizeBytes=fmt.get("filesize"),
+                        fileSizeBytes=fmt.get("filesize") or fmt.get("filesize_approx"),
                         downloadUrl=download_url,
                         requiresAuthorization=requires_auth,
                         category=self._get_format_category(fmt),
                         height=fmt.get("height"),
+                        httpHeaders={str(k): str(v) for k, v in http_headers.items()},
                     )
                     api_formats.append(format_obj)
 
@@ -299,7 +302,7 @@ class ResolverService:
             logger.exception("Unexpected error during resolution")
             raise ResolverError("EXTRACTION_FAILED", f"Unexpected error: {e!s}")
 
-    async def resolve_video(self, url: str, installation_id: str | None = None, ip_address: str | None = None, min_height: int | None = None, max_height: int | None = None, min_filesize: int | None = None, max_filesize: int | None = None, category: str | None = None) -> ResolveResponse:
+    async def resolve_video(self, url: str, installation_id: str | None = None, ip_address: str | None = None, min_height: int | None = None, max_height: int | None = None, min_filesize: int | None = None, max_filesize: int | None = None, category: str | None = None, skip_cache: bool = False) -> ResolveResponse:
         """
         Resolve video metadata and available formats with queueing.
 
@@ -312,6 +315,7 @@ class ResolverService:
             min_filesize: Minimum file size in bytes
             max_filesize: Maximum file size in bytes
             category: Filter by format category
+            skip_cache: Skip the cache and force a fresh extraction
 
         Returns:
             ResolveResponse with video metadata and formats
@@ -326,7 +330,7 @@ class ResolverService:
             active_resolutions.inc()
             start_time = time.time()
             try:
-                result = await self._resolve_video_internal(url, min_height, max_height, min_filesize, max_filesize, category)
+                result = await self._resolve_video_internal(url, min_height, max_height, min_filesize, max_filesize, category, skip_cache)
                 
                 # Log successful resolution
                 db_service.log_resolution(

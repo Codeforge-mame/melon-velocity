@@ -18,6 +18,10 @@ class VideoFormat(BaseModel):
         description="Format category: 'video' (merged video+audio), 'video-only', or 'audio-only'",
     )
     height: int | None = Field(None, description="Video height in pixels")
+    httpHeaders: dict[str, str] = Field(
+        default_factory=dict,
+        description="HTTP headers required to download this format (e.g. Referer, User-Agent)",
+    )
 
 
 class ResolveRequest(BaseModel):
@@ -29,6 +33,10 @@ class ResolveRequest(BaseModel):
     min_filesize: int | None = Field(None, description="Minimum file size in bytes")
     max_filesize: int | None = Field(None, description="Maximum file size in bytes")
     category: str | None = Field(None, description="Filter by category: 'video', 'video-only', 'audio-only'")
+    skip_cache: bool = Field(
+        default=False,
+        description="Skip the cache and force a fresh extraction (used when refreshing expired URLs)",
+    )
 
 
 class ResolveResponse(BaseModel):

@@ -42,7 +42,7 @@
         {
           "backgroundColor": "#208AEF",
           "image": "./assets/splash-icon.png",
-          "imageWidth": 76
+          "imageWidth": 200
         }
       ],
       [
@@ -53,7 +53,8 @@
           "isAccessMediaLocationEnabled": true
         }
       ],
-      "expo-sqlite"
+      "expo-sqlite",
+      "expo-video"
     ],
     "experiments": {
       "typedRoutes": true

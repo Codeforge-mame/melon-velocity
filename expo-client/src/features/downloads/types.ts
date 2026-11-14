@@ -9,6 +9,7 @@ export type VideoFormat = {
   requiresAuthorization?: boolean;
   category: FormatCategory;
   height?: number | null;
+  httpHeaders?: Record<string, string>;
 };
 
 export type Subtitle = {
@@ -70,5 +71,7 @@ export type DownloadRecord = {
   localUri?: string | null;
   error?: string | null;
   resumeData?: string | null;
+  sourceUrl?: string | null;
+  httpHeaders?: string | null;
   createdAt: number;
 };

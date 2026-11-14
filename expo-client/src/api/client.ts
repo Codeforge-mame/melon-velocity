@@ -84,17 +84,19 @@ function normalizeFormat(raw: any): VideoFormat {
     requiresAuthorization: raw.requiresAuthorization ?? false,
     category: (raw.category ?? "video") as FormatCategory,
     height: raw.height ?? null,
+    httpHeaders: raw.httpHeaders ?? raw.http_headers ?? {},
   };
 }
 
 export async function resolveVideo(
   url: string,
   filters: ResolveFilters = {},
+  skipCache = false,
 ): Promise<ResolvedVideo> {
   const response = await fetch(`${API_URL}/v1/videos/resolve`, {
     method: "POST",
     headers: await authHeaders(),
-    body: JSON.stringify({ url, ...filters }),
+    body: JSON.stringify({ url, ...filters, skip_cache: skipCache }),
   });
 
   if (!response.ok) throw await readError(response);
@@ -109,6 +111,14 @@ export async function resolveVideo(
     formats: (data.formats ?? []).map(normalizeFormat),
     subtitles: data.subtitles ?? [],
   };
+}
+
+/**
+ * Force a fresh resolution (bypassing the server cache) to obtain unexpired
+ * download URLs and headers. Used by the download retry path on 403/404.
+ */
+export async function refreshVideo(url: string): Promise<ResolvedVideo> {
+  return resolveVideo(url, {}, true);
 }
 
 export async function resolvePlaylist(url: string): Promise<ResolvedPlaylist> {

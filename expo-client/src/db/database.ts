@@ -24,12 +24,31 @@ async function init(): Promise<SQLite.SQLiteDatabase> {
       localUri TEXT,
       error TEXT,
       resumeData TEXT,
+      sourceUrl TEXT,
+      httpHeaders TEXT,
       createdAt INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_downloads_createdAt
       ON downloads (createdAt DESC);
   `);
+
+  // Migrate older databases that predate these columns.
+  await addColumnIfMissing(db, "sourceUrl", "TEXT");
+  await addColumnIfMissing(db, "httpHeaders", "TEXT");
+
   return db;
+}
+
+async function addColumnIfMissing(
+  db: SQLite.SQLiteDatabase,
+  column: string,
+  type: string,
+): Promise<void> {
+  const columns = await db.getAllAsync<{ name: string }>(
+    "PRAGMA table_info(downloads)",
+  );
+  if (columns.some((c) => c.name === column)) return;
+  await db.execAsync(`ALTER TABLE downloads ADD COLUMN ${column} ${type}`);
 }
 
 export function getDatabase(): Promise<SQLite.SQLiteDatabase> {
@@ -51,6 +70,8 @@ type DownloadRow = {
   localUri: string | null;
   error: string | null;
   resumeData: string | null;
+  sourceUrl: string | null;
+  httpHeaders: string | null;
   createdAt: number;
 };
 
@@ -69,6 +90,8 @@ function toRecord(row: DownloadRow): DownloadRecord {
     localUri: row.localUri,
     error: row.error,
     resumeData: row.resumeData,
+    sourceUrl: row.sourceUrl,
+    httpHeaders: row.httpHeaders,
     createdAt: row.createdAt,
   };
 }
@@ -78,8 +101,8 @@ export async function insertDownload(record: DownloadRecord): Promise<void> {
   await db.runAsync(
     `INSERT OR REPLACE INTO downloads
       (id, title, thumbnailUrl, filename, url, formatId, resolutionLabel, status,
-       bytesWritten, totalBytes, localUri, error, resumeData, createdAt)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       bytesWritten, totalBytes, localUri, error, resumeData, sourceUrl, httpHeaders, createdAt)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       record.id,
       record.title,
@@ -94,6 +117,8 @@ export async function insertDownload(record: DownloadRecord): Promise<void> {
       record.localUri ?? null,
       record.error ?? null,
       record.resumeData ?? null,
+      record.sourceUrl ?? null,
+      record.httpHeaders ?? null,
       record.createdAt,
     ],
   );
@@ -106,6 +131,9 @@ const UPDATABLE: (keyof DownloadRecord)[] = [
   "localUri",
   "error",
   "resumeData",
+  "url",
+  "sourceUrl",
+  "httpHeaders",
 ];
 
 export async function updateDownload(

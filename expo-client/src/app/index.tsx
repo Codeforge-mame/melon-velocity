@@ -1,6 +1,6 @@
 import { useMutation } from "@tanstack/react-query";
-import { useRouter } from "expo-router";
-import { useState } from "react";
+import { useFocusEffect, useRouter } from "expo-router";
+import { useCallback, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -16,6 +16,9 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { resolveVideo } from "@/api/client";
 import { startDownload } from "@/features/downloads/downloadManager";
 import type { FormatCategory, VideoFormat } from "@/features/downloads/types";
+import { consumeToken } from "@/features/tokens/tokenManager";
+import { useTokens } from "@/features/tokens/useTokens";
+import { useDownloads } from "@/features/downloads/useDownloads";
 
 const URL_PATTERN = /^https?:\/\/\S+$/i;
 
@@ -48,43 +51,26 @@ const CATEGORY_DESCRIPTIONS: Record<FormatCategory, string> = {
   "audio-only": "Audio only, for music or podcasts",
 };
 
+function formatKey(format: VideoFormat): string {
+  return `${format.category}-${format.formatId}-${format.downloadUrl}`;
+}
+
 export default function HomeScreen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
   const [url, setUrl] = useState("");
-  const [selectedFormat, setSelectedFormat] = useState<VideoFormat | null>(null);
+  const [pendingKey, setPendingKey] = useState<string | null>(null);
+  const { remaining, refresh, setRemaining } = useTokens();
+  const downloads = useDownloads();
+
+  useFocusEffect(
+    useCallback(() => {
+      void refresh();
+    }, [refresh]),
+  );
 
   const resolver = useMutation({
     mutationFn: (value: string) => resolveVideo(value),
-    onSuccess: () => setSelectedFormat(null),
-  });
-
-  const downloadMutation = useMutation({
-    mutationFn: async () => {
-      const video = resolver.data;
-      if (!video || !selectedFormat) {
-        throw new Error("Select a format first.");
-      }
-      const extension =
-        selectedFormat.container.replace(/[^a-z0-9]/gi, "").toLowerCase() ||
-        "mp4";
-      const id = `download-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      await startDownload({
-        id,
-        url: selectedFormat.downloadUrl,
-        title: video.title,
-        thumbnailUrl: video.thumbnailUrl,
-        filename: `${video.title}.${extension}`,
-        formatId: selectedFormat.formatId,
-        resolutionLabel: selectedFormat.label,
-      });
-    },
-    onSuccess: () => router.push("/history"),
-    onError: (error) =>
-      Alert.alert(
-        "Download failed to start",
-        error instanceof Error ? error.message : "Unknown error",
-      ),
   });
 
   const submit = () => {
@@ -94,6 +80,55 @@ export default function HomeScreen() {
       return;
     }
     resolver.mutate(value);
+  };
+
+  const handleDownload = async (format: VideoFormat) => {
+    const video = resolver.data;
+    if (!video) return;
+
+    if (remaining <= 0) {
+      Alert.alert(
+        "No downloads left",
+        "You have used all your downloads for today. Watch a rewarded ad to get more (coming soon).",
+      );
+      return;
+    }
+
+    const key = formatKey(format);
+    setPendingKey(key);
+
+    try {
+      const granted = await consumeToken();
+      if (!granted) {
+        setRemaining(0);
+        Alert.alert("No downloads left", "You have used all your downloads for today.");
+        return;
+      }
+      setRemaining(remaining - 1);
+
+      const extension =
+        format.container.replace(/[^a-z0-9]/gi, "").toLowerCase() || "mp4";
+
+      await startDownload({
+        url: format.downloadUrl,
+        title: video.title,
+        thumbnailUrl: video.thumbnailUrl,
+        filename: `${video.title}.${extension}`,
+        formatId: format.formatId,
+        resolutionLabel: format.label,
+        sourceUrl: video.sourceUrl,
+        httpHeaders: format.httpHeaders,
+      });
+
+      void refresh();
+    } catch (error) {
+      Alert.alert(
+        "Download failed to start",
+        error instanceof Error ? error.message : "Unknown error",
+      );
+    } finally {
+      setPendingKey(null);
+    }
   };
 
   const video = resolver.data;
@@ -122,12 +157,26 @@ export default function HomeScreen() {
             Paste a video link and pick a resolution.
           </Text>
         </View>
-        <Pressable
-          onPress={() => router.push("/history")}
-          className="ml-4 rounded-2xl border border-slate-700/50 bg-slate-800/60 px-4 py-3"
-        >
-          <Text className="font-semibold text-white">Downloads</Text>
-        </Pressable>
+        <View className="ml-4 items-end">
+          <Pressable
+            onPress={() => router.push("/history")}
+            className="relative rounded-2xl border border-slate-700/50 bg-slate-800/60 px-4 py-3"
+          >
+            <Text className="font-semibold text-white">Downloads</Text>
+            {downloads.length > 0 && (
+              <View className="absolute -right-2 -top-2 h-5 w-5 items-center justify-center rounded-full bg-indigo-500">
+                <Text className="text-[10px] font-bold text-white">
+                  {downloads.length > 99 ? "99+" : downloads.length}
+                </Text>
+              </View>
+            )}
+          </Pressable>
+          <View className="mt-2 flex-row items-center rounded-full border border-indigo-500/40 bg-indigo-500/10 px-3 py-1">
+            <Text className="text-xs font-semibold text-indigo-300">
+              ⚡ {remaining} left today
+            </Text>
+          </View>
+        </View>
       </View>
 
       <View className="rounded-3xl border border-slate-800/50 bg-slate-900/50 p-5">
@@ -198,54 +247,46 @@ export default function HomeScreen() {
               </Text>
 
               {group.formats.map((format) => {
-                const active = selectedFormat?.formatId === format.formatId;
+                const key = formatKey(format);
+                const pending = pendingKey === key;
                 return (
-                  <Pressable
-                    key={`${group.category}-${format.formatId}-${format.downloadUrl}`}
-                    onPress={() => setSelectedFormat(format)}
-                    className={`mb-2 rounded-2xl border p-4 ${
-                      active
-                        ? "border-indigo-500 bg-indigo-500/15"
-                        : "border-slate-800/60 bg-slate-900/50"
-                    }`}
+                  <View
+                    key={key}
+                    className="mb-2 flex-row items-center justify-between rounded-2xl border border-slate-800/60 bg-slate-900/50 p-4"
                   >
-                    <View className="flex-row items-center justify-between">
-                      <Text className="text-base font-semibold text-white">
-                        {format.label}
-                      </Text>
-                      <Text className="text-xs uppercase text-slate-400">
-                        {format.container}
+                    <View className="mr-3 flex-1">
+                      <View className="flex-row items-center justify-between">
+                        <Text className="text-base font-semibold text-white">
+                          {format.label}
+                        </Text>
+                        <Text className="ml-2 text-xs uppercase text-slate-400">
+                          {format.container}
+                        </Text>
+                      </View>
+                      <Text className="mt-1 text-xs text-slate-400">
+                        {formatBytes(format.fileSizeBytes)}
+                        {format.requiresAuthorization
+                          ? " • requires authorization"
+                          : ""}
                       </Text>
                     </View>
-                    <Text className="mt-1 text-xs text-slate-400">
-                      {formatBytes(format.fileSizeBytes)}
-                      {format.requiresAuthorization ? " • requires authorization" : ""}
-                    </Text>
-                  </Pressable>
+
+                    <Pressable
+                      onPress={() => void handleDownload(format)}
+                      disabled={pending}
+                      className="rounded-xl bg-indigo-500 px-4 py-3 active:opacity-80"
+                    >
+                      {pending ? (
+                        <ActivityIndicator color="#ffffff" size="small" />
+                      ) : (
+                        <Text className="font-bold text-white">⬇</Text>
+                      )}
+                    </Pressable>
+                  </View>
                 );
               })}
             </View>
           ))}
-
-          <Pressable
-            onPress={() => downloadMutation.mutate()}
-            disabled={!selectedFormat || downloadMutation.isPending}
-            className={`mt-6 items-center rounded-2xl p-4 ${
-              selectedFormat ? "bg-indigo-500 active:opacity-80" : "bg-slate-800"
-            }`}
-          >
-            {downloadMutation.isPending ? (
-              <ActivityIndicator color="#ffffff" />
-            ) : (
-              <Text
-                className={`text-lg font-bold ${
-                  selectedFormat ? "text-white" : "text-slate-500"
-                }`}
-              >
-                {selectedFormat ? `Download ${selectedFormat.label}` : "Select a format"}
-              </Text>
-            )}
-          </Pressable>
         </View>
       )}
     </ScrollView>

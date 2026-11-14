@@ -1,7 +1,6 @@
 import { useEffect, useSyncExternalStore } from "react";
 
 import {
-  bindDownloadLifecycle,
   getDownloads,
   hydrateDownloads,
   subscribeDownloads,
@@ -10,7 +9,6 @@ import type { DownloadRecord } from "./types";
 
 export function useDownloads(): DownloadRecord[] {
   useEffect(() => {
-    bindDownloadLifecycle();
     void hydrateDownloads();
   }, []);
 

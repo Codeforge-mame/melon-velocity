@@ -21,6 +21,7 @@ export default function RootLayout() {
           >
             <Stack.Screen name="index" />
             <Stack.Screen name="history" />
+            <Stack.Screen name="player" options={{ presentation: "modal" }} />
           </Stack>
         </QueryProvider>
       </SafeAreaProvider>

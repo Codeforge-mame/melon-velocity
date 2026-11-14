@@ -1,9 +1,8 @@
-import { AppState } from "react-native";
-import type { AppStateStatus } from "react-native";
-import { Directory, File, Paths, DownloadTask } from "expo-file-system";
+import { Directory, DownloadTask, File, Paths } from "expo-file-system";
 import type { DownloadPauseState } from "expo-file-system";
 import * as MediaLibrary from "expo-media-library";
 
+import { refreshVideo } from "@/api/client";
 import {
   deleteCompletedDownloads,
   deleteDownload as dbDeleteDownload,
@@ -16,6 +15,9 @@ import type { DownloadRecord, DownloadStatus } from "./types";
 
 const MAX_CONCURRENT = 2;
 const PROGRESS_PERSIST_INTERVAL = 1500;
+const MAX_RERESOLVE_ATTEMPTS = 2;
+const MAX_BACKOFF_ATTEMPTS = 3;
+const BACKOFF_DELAYS_MS = [2000, 4000, 8000];
 
 type Listener = () => void;
 
@@ -26,6 +28,8 @@ const listeners = new Set<Listener>();
 const queue: string[] = [];
 const active = new Map<string, DownloadTask>();
 const lastPersist = new Map<string, number>();
+const reResolveAttempts = new Map<string, number>();
+const backoffAttempts = new Map<string, number>();
 
 function find(id: string): DownloadRecord | undefined {
   return records.find((r) => r.id === id);
@@ -56,6 +60,11 @@ async function patch(
   }
 }
 
+function resetAttempts(id: string) {
+  reResolveAttempts.delete(id);
+  backoffAttempts.delete(id);
+}
+
 export function getDownloads(): DownloadRecord[] {
   return records;
 }
@@ -66,9 +75,9 @@ export function subscribeDownloads(listener: Listener): () => void {
 }
 
 /**
- * Load persisted downloads and reconcile any in-flight rows from a previous
- * session. Rows that were mid-download can only be resumed when resume data
- * was saved; otherwise they restart from scratch on resume.
+ * Load persisted downloads. Any row left mid-flight by a previous session can
+ * only be resumed when the file reached its destination; otherwise it becomes
+ * a restartable paused entry.
  */
 export async function hydrateDownloads(): Promise<void> {
   if (hydrated) return;
@@ -76,10 +85,12 @@ export async function hydrateDownloads(): Promise<void> {
 
   const rows = await getAllDownloads();
   const reconciled = rows.map((row) => {
-    if (
-      row.status === "downloading" ||
-      row.status === "queued"
-    ) {
+    if (row.status === "downloading" || row.status === "queued") {
+      const destination = destinationFor(row);
+      const finished = destination.exists && (destination.size ?? 0) > 0;
+      if (finished) {
+        return { ...row, status: "completed" as DownloadStatus, error: null };
+      }
       return { ...row, status: "paused" as DownloadStatus, error: null };
     }
     return row;
@@ -106,8 +117,20 @@ function destinationFor(record: DownloadRecord): File {
   return new File(downloadDir, `${record.id}-${safeName}`);
 }
 
+function parseHeaders(record: DownloadRecord): Record<string, string> {
+  if (!record.httpHeaders) return {};
+  try {
+    const parsed = JSON.parse(record.httpHeaders);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
 function makeTask(record: DownloadRecord): DownloadTask {
   return new DownloadTask(record.url, destinationFor(record), {
+    sessionType: "background",
+    headers: parseHeaders(record),
     onProgress: ({ bytesWritten, totalBytes }) => {
       void handleProgress(record.id, bytesWritten, totalBytes);
     },
@@ -126,20 +149,36 @@ async function handleProgress(
   await patch(id, { bytesWritten, totalBytes }, shouldPersist);
 }
 
-async function saveToLibrary(file: File): Promise<string> {
+export async function saveFileToGallery(fileUri: string): Promise<boolean> {
   try {
     const { granted } = await MediaLibrary.requestPermissionsAsync();
-    if (!granted) return file.uri;
-    const asset = await MediaLibrary.Asset.create(file.uri);
-    return (await asset.getUri()) ?? file.uri;
+    if (!granted) return false;
+    await MediaLibrary.Asset.create(fileUri);
+    return true;
   } catch {
-    return file.uri;
+    return false;
   }
+}
+
+async function saveToLibrary(file: File): Promise<string> {
+  const saved = await saveFileToGallery(file.uri);
+  if (!saved) return file.uri;
+  return file.uri;
+}
+
+/**
+ * Manually save an already-downloaded item to the device gallery.
+ */
+export async function saveDownloadToGallery(id: string): Promise<boolean> {
+  const record = find(id);
+  if (!record?.localUri) return false;
+  return saveFileToGallery(record.localUri);
 }
 
 async function finalize(id: string, file: File): Promise<void> {
   const localUri = await saveToLibrary(file);
   lastPersist.delete(id);
+  resetAttempts(id);
   await patch(id, {
     status: "completed",
     localUri,
@@ -159,24 +198,153 @@ async function fail(id: string, error: unknown): Promise<void> {
   });
 }
 
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function httpStatusFromError(error: unknown): number | null {
+  const match = /HTTP\s+(\d{3})/.exec(errorMessage(error));
+  return match ? parseInt(match[1], 10) : null;
+}
+
+function isNetworkError(error: unknown): boolean {
+  const msg = errorMessage(error).toLowerCase();
+  return (
+    msg.includes("no address associated with hostname") ||
+    msg.includes("getaddrinfo") ||
+    msg.includes("enotfound") ||
+    msg.includes("nodename nor servname") ||
+    msg.includes("network is unreachable") ||
+    msg.includes("connection reset") ||
+    msg.includes("timed out")
+  );
+}
+
+/**
+ * Fetch a fresh download URL + headers for a record whose stored URL has
+ * expired (403/404). Returns true when a matching format was refreshed.
+ */
+async function refreshRecordUrl(id: string): Promise<boolean> {
+  const record = find(id);
+  if (!record?.sourceUrl) return false;
+
+  try {
+    const fresh = await refreshVideo(record.sourceUrl);
+    const match =
+      fresh.formats.find((f) => f.formatId === record.formatId) ??
+      fresh.formats.find((f) => f.label === record.resolutionLabel);
+
+    if (!match?.downloadUrl) return false;
+
+    await patch(id, {
+      url: match.downloadUrl,
+      httpHeaders: JSON.stringify(match.httpHeaders ?? {}),
+      error: null,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+type RetryAction =
+  | { kind: "reresolve" }
+  | { kind: "backoff"; delay: number }
+  | { kind: "fail" };
+
+function planRetry(id: string, error: unknown): RetryAction {
+  const status = httpStatusFromError(error);
+
+  if (status === 403 || status === 404) {
+    const attempts = reResolveAttempts.get(id) ?? 0;
+    if (attempts < MAX_RERESOLVE_ATTEMPTS) {
+      reResolveAttempts.set(id, attempts + 1);
+      return { kind: "reresolve" };
+    }
+    return { kind: "fail" };
+  }
+
+  if (isNetworkError(error)) {
+    const attempts = backoffAttempts.get(id) ?? 0;
+    if (attempts < MAX_BACKOFF_ATTEMPTS) {
+      backoffAttempts.set(id, attempts + 1);
+      return { kind: "backoff", delay: BACKOFF_DELAYS_MS[attempts] ?? 8000 };
+    }
+    return { kind: "fail" };
+  }
+
+  return { kind: "fail" };
+}
+
 async function execute(
   id: string,
-  task: DownloadTask,
+  initialTask: DownloadTask,
   mode: "start" | "resume",
 ): Promise<void> {
+  let task = initialTask;
+  let currentMode = mode;
   active.set(id, task);
   await patch(id, { status: "downloading", error: null });
 
   try {
-    const file =
-      mode === "resume" ? await task.resumeAsync() : await task.downloadAsync();
-    if (file) {
-      await finalize(id, file);
-    } else {
-      await fail(id, new Error("Download interrupted"));
+    for (;;) {
+      try {
+        const file =
+          currentMode === "resume"
+            ? await task.resumeAsync()
+            : await task.downloadAsync();
+
+        if (file) {
+          await finalize(id, file);
+        } else {
+          await fail(id, new Error("Download interrupted"));
+        }
+        return;
+      } catch (error) {
+        const action = planRetry(id, error);
+
+        if (action.kind === "reresolve") {
+          const refreshed = await refreshRecordUrl(id);
+          if (!refreshed) {
+            await fail(id, error);
+            return;
+          }
+          task.release();
+          const record = find(id);
+          if (!record) {
+            await fail(id, error);
+            return;
+          }
+          task = makeTask(record);
+          active.set(id, task);
+          currentMode = "start";
+          await patch(id, { status: "downloading", error: null });
+          continue;
+        }
+
+        if (action.kind === "backoff") {
+          await sleep(action.delay);
+          const record = find(id);
+          if (!record) {
+            await fail(id, error);
+            return;
+          }
+          task.release();
+          task = makeTask(record);
+          active.set(id, task);
+          currentMode = "start";
+          await patch(id, { status: "downloading", error: null });
+          continue;
+        }
+
+        await fail(id, error);
+        return;
+      }
     }
-  } catch (error) {
-    await fail(id, error);
   } finally {
     active.delete(id);
     task.release();
@@ -194,18 +362,24 @@ function pump(): void {
 }
 
 export type StartDownloadInput = {
-  id: string;
+  id?: string;
   url: string;
   title: string;
   thumbnailUrl?: string | null;
   filename: string;
   formatId: string;
   resolutionLabel: string;
+  sourceUrl?: string;
+  httpHeaders?: Record<string, string>;
 };
+
+function generateId(): string {
+  return `download-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
 
 export async function startDownload(input: StartDownloadInput): Promise<void> {
   const record: DownloadRecord = {
-    id: input.id,
+    id: input.id ?? generateId(),
     title: input.title,
     thumbnailUrl: input.thumbnailUrl ?? null,
     filename: input.filename,
@@ -218,9 +392,14 @@ export async function startDownload(input: StartDownloadInput): Promise<void> {
     localUri: null,
     error: null,
     resumeData: null,
+    sourceUrl: input.sourceUrl ?? null,
+    httpHeaders: input.httpHeaders
+      ? JSON.stringify(input.httpHeaders)
+      : null,
     createdAt: Date.now(),
   };
 
+  resetAttempts(record.id);
   setRecords(sortRecords([record, ...records]));
   await insertDownload(record);
   queue.push(record.id);
@@ -258,10 +437,13 @@ export async function resumeDownload(id: string): Promise<void> {
   if (!record) return;
   if (record.status !== "paused" && record.status !== "error") return;
 
+  resetAttempts(id);
+
   if (record.resumeData) {
     try {
       const state = JSON.parse(record.resumeData) as DownloadPauseState;
       const task = DownloadTask.fromSavable(state, {
+        sessionType: "background",
         onProgress: ({ bytesWritten, totalBytes }) => {
           void handleProgress(id, bytesWritten, totalBytes);
         },
@@ -292,6 +474,7 @@ export async function cancelDownload(id: string): Promise<void> {
 export async function removeDownload(id: string): Promise<void> {
   await cancelDownload(id);
   setRecords(records.filter((r) => r.id !== id));
+  resetAttempts(id);
   await dbDeleteDownload(id);
   pump();
 }
@@ -299,22 +482,4 @@ export async function removeDownload(id: string): Promise<void> {
 export async function clearCompleted(): Promise<void> {
   setRecords(records.filter((r) => r.status !== "completed"));
   await deleteCompletedDownloads();
-}
-
-let appStateBound = false;
-
-/**
- * Bind a global AppState listener so active downloads are paused (and their
- * resume state persisted) when the app is backgrounded.
- */
-export function bindDownloadLifecycle(): void {
-  if (appStateBound) return;
-  appStateBound = true;
-  AppState.addEventListener("change", (state: AppStateStatus) => {
-    if (state !== "active") {
-      for (const id of active.keys()) {
-        void pauseDownload(id);
-      }
-    }
-  });
 }

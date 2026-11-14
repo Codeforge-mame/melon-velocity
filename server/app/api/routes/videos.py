@@ -74,6 +74,7 @@ async def resolve_video(request: Request, body: ResolveRequest):
             min_filesize=body.min_filesize,
             max_filesize=body.max_filesize,
             category=body.category,
+            skip_cache=body.skip_cache,
         )
         logger.info(f"Successfully resolved: {result.title} with {len(result.formats)} formats")
         return result
