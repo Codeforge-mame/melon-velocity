@@ -17,17 +17,53 @@ import {
 import { resolveMediaUrl, VideoQuality } from './cobalt';
 
 Notifications.setNotificationHandler({
-  handleNotification: async () => ({
-    shouldShowAlert: true,
-    shouldPlaySound: false,
-    shouldSetBadge: false,
-    shouldShowBanner: true,
-    shouldShowList: true,
-  }),
+  handleNotification: async (notification) => {
+    const isProgressUpdate =
+      notification.request.content.data?.progressUpdate === true;
+    return {
+      shouldShowAlert: !isProgressUpdate,
+      shouldPlaySound: false,
+      shouldSetBadge: false,
+      shouldShowBanner: !isProgressUpdate,
+      shouldShowList: true,
+    };
+  },
 });
 
 const activeTasks = new Map<string, FileSystem.DownloadResumable>();
 const lastDbSync = new Map<string, number>();
+const cancelledDownloads = new Set<string>();
+const lastNotificationUpdate = new Map<string, { key: string; time: number }>();
+const handledNotificationResponses = new Set<string>();
+const notificationId = (id: string) => `dl-${id}`;
+type DownloadNotificationState = Pick<
+  DownloadItem,
+  'id' | 'title' | 'status' | 'progress' | 'error_message'
+>;
+
+const notificationActions: Record<DownloadItem['status'], Notifications.NotificationAction[]> = {
+  queued: [
+    { identifier: 'delete', buttonTitle: 'Delete', options: { isDestructive: true } },
+  ],
+  downloading: [
+    { identifier: 'pause', buttonTitle: 'Pause' },
+    { identifier: 'delete', buttonTitle: 'Delete', options: { isDestructive: true } },
+  ],
+  paused: [
+    { identifier: 'resume', buttonTitle: 'Resume' },
+    { identifier: 'delete', buttonTitle: 'Delete', options: { isDestructive: true } },
+  ],
+  failed: [
+    { identifier: 'retry', buttonTitle: 'Retry' },
+    { identifier: 'delete', buttonTitle: 'Delete', options: { isDestructive: true } },
+  ],
+  completed: [
+    { identifier: 'delete', buttonTitle: 'Delete', options: { isDestructive: true } },
+  ],
+};
+
+let notificationCategoriesSetup: Promise<void> | undefined;
+let notificationPermissionGranted = false;
 
 type Listener = () => void;
 const listeners = new Set<Listener>();
@@ -41,7 +77,25 @@ function notifyUI() {
   listeners.forEach((fn) => fn());
 }
 
+function registerNotificationCategories(): Promise<void> {
+  if (!notificationCategoriesSetup) {
+    notificationCategoriesSetup = Promise.all(
+      Object.entries(notificationActions).map(([status, actions]) =>
+        Notifications.setNotificationCategoryAsync(`download-${status}`, actions)
+      )
+    )
+      .then(() => undefined)
+      .catch((error: unknown) => {
+        notificationCategoriesSetup = undefined;
+        throw error;
+      });
+  }
+  return notificationCategoriesSetup;
+}
+
 export async function ensureNotificationPermissions(): Promise<boolean> {
+  await registerNotificationCategories();
+
   if (Platform.OS === 'android') {
     await Notifications.setNotificationChannelAsync('rooster-downloads', {
       name: 'Rooster Downloads',
@@ -51,21 +105,134 @@ export async function ensureNotificationPermissions(): Promise<boolean> {
   }
 
   const { status: existingStatus } = await Notifications.getPermissionsAsync();
-  if (existingStatus === 'granted') return true;
+  if (existingStatus === 'granted') {
+    notificationPermissionGranted = true;
+    return true;
+  }
 
   const { status } = await Notifications.requestPermissionsAsync();
-  return status === 'granted';
+  notificationPermissionGranted = status === 'granted';
+  return notificationPermissionGranted;
 }
 
-async function sendDownloadNotification(title: string, body: string, id: string) {
-  const granted = await ensureNotificationPermissions();
-  if (!granted) return;
+async function updateDownloadNotification(
+  item: DownloadNotificationState,
+  force = false
+): Promise<void> {
+  if (!notificationPermissionGranted) return;
+
+  const percent = Math.floor(Math.min(Math.max(item.progress || 0, 0), 1) * 100);
+  const key = `${item.status}:${percent}:${item.error_message || ''}`;
+  const id = notificationId(item.id);
+  const now = Date.now();
+  const previous = lastNotificationUpdate.get(item.id);
+
+  if (previous?.key === key) return;
+  if (
+    !force &&
+    item.status === 'downloading' &&
+    previous &&
+    now - previous.time < 2000
+  ) {
+    return;
+  }
+
+  const body =
+    item.status === 'downloading'
+      ? `Downloading · ${percent}%`
+      : item.status === 'paused'
+        ? `Paused · ${percent}%`
+        : item.status === 'queued'
+          ? 'Preparing download…'
+          : item.status === 'completed'
+            ? 'Download complete'
+            : item.error_message || 'Download failed';
+
+  await Notifications.dismissNotificationAsync(id);
 
   await Notifications.scheduleNotificationAsync({
-    identifier: `dl-${id}`,
-    content: { title, body, sound: false },
-    trigger: null,
+    identifier: id,
+    content: {
+      title: item.title,
+      body,
+      sound: false,
+      categoryIdentifier: `download-${item.status}`,
+      sticky: item.status === 'downloading' || item.status === 'paused',
+      data: {
+        downloadId: item.id,
+        progressUpdate: item.status === 'downloading',
+      },
+    },
+    trigger:
+      Platform.OS === 'android' ? { channelId: 'rooster-downloads' } : null,
   });
+
+  lastNotificationUpdate.set(item.id, { key, time: now });
+}
+
+async function dismissDownloadNotification(id: string): Promise<void> {
+  await Notifications.dismissNotificationAsync(notificationId(id));
+  lastNotificationUpdate.delete(id);
+}
+
+async function handleDownloadNotificationResponse(
+  response: Notifications.NotificationResponse
+): Promise<void> {
+  const action = response.actionIdentifier;
+  if (!['pause', 'resume', 'retry', 'delete'].includes(action)) return;
+
+  const key = `${response.notification.request.identifier}:${action}:${response.notification.date}`;
+  if (handledNotificationResponses.has(key)) return;
+  handledNotificationResponses.add(key);
+  if (handledNotificationResponses.size > 100) {
+    const oldestResponse = handledNotificationResponses.values().next().value;
+    if (oldestResponse) handledNotificationResponses.delete(oldestResponse);
+  }
+
+  const downloadId = response.notification.request.content.data?.downloadId;
+  if (typeof downloadId !== 'string') return;
+
+  const item = (await getAllDownloads()).find((download) => download.id === downloadId);
+  if (!item) {
+    await dismissDownloadNotification(downloadId);
+    return;
+  }
+
+  if (action === 'pause' && item.status === 'downloading') {
+    await pauseDownload(item.id);
+  } else if (action === 'resume' && item.status === 'paused') {
+    await resumeDownload(item);
+  } else if (action === 'retry' && item.status === 'failed') {
+    await retryDownload(item);
+  } else if (action === 'delete') {
+    await removeDownload(item);
+  }
+}
+
+export async function registerDownloadNotificationActions(): Promise<{
+  remove: () => void;
+}> {
+  await registerNotificationCategories();
+  const { status } = await Notifications.getPermissionsAsync();
+  notificationPermissionGranted = status === 'granted';
+  const subscription = Notifications.addNotificationResponseReceivedListener((response) => {
+    void handleDownloadNotificationResponse(response).catch((error: unknown) => {
+      console.error('Failed to handle download notification action.', error);
+    });
+  });
+
+  try {
+    const lastResponse = Notifications.getLastNotificationResponse();
+    if (lastResponse) {
+      await handleDownloadNotificationResponse(lastResponse);
+      Notifications.clearLastNotificationResponse();
+    }
+  } catch (error) {
+    subscription.remove();
+    throw error;
+  }
+
+  return subscription;
 }
 
 async function generateAndSaveThumbnail(id: string, videoUri: string): Promise<string | null> {
@@ -107,25 +274,55 @@ export async function startNewDownload(
     error_message: null,
   });
   notifyUI();
+  await updateDownloadNotification({
+    id,
+    title: 'Preparing download',
+    status: 'queued',
+    progress: 0,
+    error_message: null,
+  }, true);
 
   try {
     const resolved = await resolveMediaUrl({ url: sourceUrl, mode, quality });
+    if (cancelledDownloads.has(id)) {
+      cancelledDownloads.delete(id);
+      return id;
+    }
 
     const db = await import('../db/database').then((m) => m.getDB());
     await db.runAsync(
       'UPDATE downloads SET title = ?, filename = ?, resolved_url = ?, status = ? WHERE id = ?',
       [resolved.title, resolved.filename, resolved.streamUrl, 'downloading', id]
     );
+    if (cancelledDownloads.has(id)) {
+      cancelledDownloads.delete(id);
+      return id;
+    }
     notifyUI();
 
-    await sendDownloadNotification('Downloading started', resolved.title, id);
+    await updateDownloadNotification({
+      id,
+      title: resolved.title,
+      status: 'downloading',
+      progress: 0,
+      error_message: null,
+    }, true);
+    if (cancelledDownloads.has(id)) {
+      cancelledDownloads.delete(id);
+      return id;
+    }
     await executeDownloadTask(id, resolved.streamUrl, resolved.filename, resolved.title, mode);
     return id;
   } catch (err: any) {
+    if (cancelledDownloads.has(id)) {
+      cancelledDownloads.delete(id);
+      return id;
+    }
     const message = err?.message || 'Failed to resolve media link.';
     await updateDownloadState(id, { status: 'failed', error_message: message });
     notifyUI();
-    await sendDownloadNotification('Download failed', message, id);
+    const failedItem = (await getAllDownloads()).find((item) => item.id === id);
+    if (failedItem) await updateDownloadNotification(failedItem, true);
     throw err;
   }
 }
@@ -154,6 +351,17 @@ async function executeDownloadTask(
       lastDbSync.set(id, now);
       await updateDownloadState(id, { progress: ratio });
       notifyUI();
+      try {
+        await updateDownloadNotification({
+          id,
+          title,
+          status: 'downloading',
+          progress: ratio,
+          error_message: null,
+        });
+      } catch (error) {
+        console.error('Failed to update download progress notification.', error);
+      }
     }
   };
 
@@ -171,6 +379,7 @@ async function executeDownloadTask(
     activeTasks.delete(id);
     lastDbSync.delete(id);
 
+    if (cancelledDownloads.has(id)) return;
     if (!result) return;
     if (result.status >= 400) {
       throw new Error(`Server returned HTTP ${result.status}`);
@@ -178,6 +387,7 @@ async function executeDownloadTask(
 
     const thumbnailUri =
       mode !== 'audio' ? await generateAndSaveThumbnail(id, result.uri) : null;
+    if (cancelledDownloads.has(id)) return;
 
     await updateDownloadState(id, {
       status: 'completed',
@@ -189,11 +399,13 @@ async function executeDownloadTask(
     });
     notifyUI();
 
-    await sendDownloadNotification('Download complete', title, id);
+    const completedItem = (await getAllDownloads()).find((item) => item.id === id);
+    if (completedItem) await updateDownloadNotification(completedItem, true);
   } catch (err: any) {
     activeTasks.delete(id);
     lastDbSync.delete(id);
 
+    if (cancelledDownloads.has(id)) return;
     const currentItems = await getAllDownloads();
     const current = currentItems.find((item) => item.id === id);
     if (current?.status === 'paused') return;
@@ -202,7 +414,8 @@ async function executeDownloadTask(
     await updateDownloadState(id, { status: 'failed', error_message: message });
     notifyUI();
 
-    await sendDownloadNotification('Download failed', `${title}: ${message}`, id);
+    const failedItem = (await getAllDownloads()).find((item) => item.id === id);
+    if (failedItem) await updateDownloadNotification(failedItem, true);
   }
 }
 
@@ -224,6 +437,9 @@ export async function pauseDownload(id: string): Promise<void> {
       activeTasks.delete(id);
     }
   }
+
+  const pausedItem = (await getAllDownloads()).find((item) => item.id === id);
+  if (pausedItem) await updateDownloadNotification(pausedItem, true);
 }
 
 export async function resumeDownload(item: DownloadItem): Promise<void> {
@@ -232,7 +448,16 @@ export async function resumeDownload(item: DownloadItem): Promise<void> {
   }
 
   await updateDownloadState(item.id, { status: 'downloading', error_message: null });
+  if (cancelledDownloads.has(item.id)) {
+    cancelledDownloads.delete(item.id);
+    return;
+  }
   notifyUI();
+  await updateDownloadNotification({ ...item, status: 'downloading' }, true);
+  if (cancelledDownloads.has(item.id)) {
+    cancelledDownloads.delete(item.id);
+    return;
+  }
 
   await executeDownloadTask(
     item.id,
@@ -252,6 +477,7 @@ export async function retryDownload(item: DownloadItem): Promise<void> {
     error_message: null,
   });
   notifyUI();
+  await updateDownloadNotification({ ...item, status: 'queued', progress: 0 }, true);
 
   try {
     const resolved = await resolveMediaUrl({
@@ -259,26 +485,50 @@ export async function retryDownload(item: DownloadItem): Promise<void> {
       mode: item.mode,
       quality: item.quality as VideoQuality,
     });
+    if (cancelledDownloads.has(item.id)) {
+      cancelledDownloads.delete(item.id);
+      return;
+    }
 
     await updateDownloadState(item.id, {
       status: 'downloading',
       resolved_url: resolved.streamUrl,
     });
+    if (cancelledDownloads.has(item.id)) {
+      cancelledDownloads.delete(item.id);
+      return;
+    }
     notifyUI();
+    await updateDownloadNotification({
+      ...item,
+      title: resolved.title,
+      status: 'downloading',
+      progress: 0,
+    }, true);
+    if (cancelledDownloads.has(item.id)) {
+      cancelledDownloads.delete(item.id);
+      return;
+    }
 
     await executeDownloadTask(
       item.id,
       resolved.streamUrl,
       item.filename,
-      item.title,
+      resolved.title,
       item.mode
     );
   } catch (err: any) {
+    if (cancelledDownloads.has(item.id)) {
+      cancelledDownloads.delete(item.id);
+      return;
+    }
     await updateDownloadState(item.id, {
       status: 'failed',
       error_message: err?.message || 'Retry failed.',
     });
     notifyUI();
+    const failedItem = (await getAllDownloads()).find((download) => download.id === item.id);
+    if (failedItem) await updateDownloadNotification(failedItem, true);
   }
 }
 
@@ -317,6 +567,10 @@ export async function shareDownloadedItem(item: DownloadItem): Promise<void> {
 }
 
 export async function removeDownload(item: DownloadItem): Promise<void> {
+  if (item.status === 'queued' || item.status === 'downloading' || item.status === 'paused') {
+    cancelledDownloads.add(item.id);
+  }
+
   const task = activeTasks.get(item.id);
   if (task) {
     try {
@@ -338,5 +592,8 @@ export async function removeDownload(item: DownloadItem): Promise<void> {
   }
 
   await deleteDownloadRecord(item.id);
+  await dismissDownloadNotification(item.id);
   notifyUI();
+
+  if (task) cancelledDownloads.delete(item.id);
 }

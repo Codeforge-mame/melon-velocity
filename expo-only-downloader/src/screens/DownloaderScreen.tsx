@@ -87,7 +87,7 @@ export function DownloaderScreen({ onOpenHistory }: Props) {
             <ActivityIndicator size="small" color="#ef4444" />
             <Text numberOfLines={1} className="text-zinc-200 text-xs font-bold flex-1">
               {activeDownloads.length === 1
-                ? `Downloading: ${activeDownloads.title}`
+                ? `Downloading: ${activeDownloads[0].title}`
                 : `${activeDownloads.length} videos downloading in background`}
             </Text>
           </View>
